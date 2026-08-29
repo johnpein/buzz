@@ -6,8 +6,8 @@ const TRUSTED_BUZZ_ACP: &str = "/Users/gabriel/.buzz/RUNTIME/buzz-acp/5567fcc400
 const CONTEXT_ENGINE_INSTALL_LOCK: &str =
     "/Users/gabriel/.buzz/RUNTIME/deployment-control/install.lock";
 const TRUSTED_CONTEXT_ENGINE_NODE: &str = "/Users/gabriel/.buzz/RUNTIME/trusted-node/d36b3d980963d44bd2c5e844fac4cfeee26a167b744287a4e74a9575af9d0559/node";
-const TRUSTED_GABE_CONTEXT_ENGINE_ADAPTER: &str = "/Users/gabriel/.buzz/RUNTIME/context-engine/13c01b0fe460c8be222307bff90656db4d11932d9e61b0eb219dd98d0f323621/scripts/gabe-acp.mjs";
-const TRUSTED_STACY_CONTEXT_ENGINE_ADAPTER: &str = "/Users/gabriel/.buzz/RUNTIME/stacy-context-engine/13c01b0fe460c8be222307bff90656db4d11932d9e61b0eb219dd98d0f323621/scripts/gabe-acp.mjs";
+const TRUSTED_GABE_CONTEXT_ENGINE_ADAPTER: &str = "/Users/gabriel/.buzz/RUNTIME/context-engine/96a8efaf20cbc1cb92fb2ae2eca5a0bdefabba42f9cd6e2ca21299c724bd7c5c/scripts/gabe-acp.mjs";
+const TRUSTED_STACY_CONTEXT_ENGINE_ADAPTER: &str = "/Users/gabriel/.buzz/RUNTIME/stacy-context-engine/96a8efaf20cbc1cb92fb2ae2eca5a0bdefabba42f9cd6e2ca21299c724bd7c5c/scripts/gabe-acp.mjs";
 const CONTEXT_ENGINE_IDENTITY_KEYS: [&str; 4] = [
     "BUZZ_GABE_AGENT_PUBKEY",
     "BUZZ_GABE_OWNER_PUBKEY",
