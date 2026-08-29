@@ -470,7 +470,6 @@ freeze_runtime_namespace() {
 
 install_or_reuse_tree() {
   local staged="$1" destination="$2" kind="$3" parent staged_digest staged_identity installed_digest installed_identity
-  prepare_tree_modes "$staged" "$kind"
   [[ -z "$(/usr/bin/find "$staged" -type l -print -quit)" ]] || {
     printf 'FATAL: staged runtime contains a symlink: %s\n' "$staged" >&2
     exit 1
@@ -515,6 +514,11 @@ install_or_reuse_tree() {
     exit 1
   }
   installed_paths+=("$destination|$installed_identity")
+  # Keep the staged directory writable until after rename. On macOS, moving a
+  # read-only directory across parents fails with EPERM even when both parents
+  # are operator-owned. Freeze the tree only after its inode is at the reviewed
+  # destination; the install lock and identity check still close the race.
+  prepare_tree_modes "$destination" "$kind"
   /usr/bin/chflags -R uchg "$destination"
   installed_digest="$(tree_digest "$destination")"
   [[ "$installed_digest" == "$staged_digest" ]] || {
