@@ -1771,6 +1771,49 @@ struct RuntimePreflight {
     deployment_fingerprint: Option<[u8; 32]>,
 }
 
+fn probe_trusted_health(address: &str) -> Result<(), String> {
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::Duration;
+
+    let socket: SocketAddr = address
+        .parse()
+        .map_err(|_| "trusted health address is invalid".to_string())?;
+    let mut stream = TcpStream::connect_timeout(&socket, Duration::from_secs(3))
+        .map_err(|_| "trusted Context Engine is unreachable".to_string())?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .map_err(|_| "cannot bound trusted health read".to_string())?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .map_err(|_| "cannot bound trusted health write".to_string())?;
+    stream
+        .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .map_err(|_| "trusted health request failed".to_string())?;
+    let mut response = [0u8; 512];
+    let count = stream
+        .read(&mut response)
+        .map_err(|_| "trusted health response failed".to_string())?;
+    let head = std::str::from_utf8(&response[..count])
+        .map_err(|_| "trusted health response is invalid".to_string())?;
+    if !head.starts_with("HTTP/1.1 200 ") && !head.starts_with("HTTP/1.0 200 ") {
+        return Err("trusted Context Engine health check rejected the runtime".into());
+    }
+    Ok(())
+}
+
+fn probe_trusted_health_with_retry(address: &str) -> Result<(), String> {
+    // A single host stall (gateway GC pause, machine load) can push the
+    // normally ~35ms probe past the 3s read bound; one retry after a short
+    // backoff absorbs that without weakening the check — a genuinely dead
+    // gateway fails both attempts and the circuit still opens.
+    if probe_trusted_health(address).is_ok() {
+        return Ok(());
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    probe_trusted_health(address)
+}
+
 fn validate_runtime_preflight(spec: &TrustedHarnessSpec) -> Result<RuntimePreflight, String> {
     let mut capability_key = None;
     if let Some(home) = spec.capability_home {
@@ -1848,33 +1891,7 @@ fn validate_runtime_preflight(spec: &TrustedHarnessSpec) -> Result<RuntimePrefli
     }
 
     if let Some(address) = spec.health_addr {
-        use std::io::{Read, Write};
-        use std::net::{SocketAddr, TcpStream};
-        use std::time::Duration;
-
-        let socket: SocketAddr = address
-            .parse()
-            .map_err(|_| "trusted health address is invalid".to_string())?;
-        let mut stream = TcpStream::connect_timeout(&socket, Duration::from_secs(3))
-            .map_err(|_| "trusted Context Engine is unreachable".to_string())?;
-        stream
-            .set_read_timeout(Some(Duration::from_secs(3)))
-            .map_err(|_| "cannot bound trusted health read".to_string())?;
-        stream
-            .set_write_timeout(Some(Duration::from_secs(3)))
-            .map_err(|_| "cannot bound trusted health write".to_string())?;
-        stream
-            .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-            .map_err(|_| "trusted health request failed".to_string())?;
-        let mut response = [0u8; 512];
-        let count = stream
-            .read(&mut response)
-            .map_err(|_| "trusted health response failed".to_string())?;
-        let head = std::str::from_utf8(&response[..count])
-            .map_err(|_| "trusted health response is invalid".to_string())?;
-        if !head.starts_with("HTTP/1.1 200 ") && !head.starts_with("HTTP/1.0 200 ") {
-            return Err("trusted Context Engine health check rejected the runtime".into());
-        }
+        probe_trusted_health_with_retry(address)?;
     }
 
     if !spec.outbox_dir.is_empty() {
@@ -5134,5 +5151,44 @@ channels = "ALL"
             "Found secret-bearing env args without hide_env_values=true. \
              Add `hide_env_values = true` to each: {violations:?}"
         );
+    }
+
+    #[test]
+    fn trusted_health_probe_retries_once_after_transient_failure() {
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind health stub");
+        let address = listener.local_addr().expect("stub address").to_string();
+        let server = std::thread::spawn(move || {
+            // First connection: close without responding (transient stall/failure).
+            let (first, _) = listener.accept().expect("accept first probe");
+            drop(first);
+            // Second connection: healthy response — the retry must succeed.
+            let (mut second, _) = listener.accept().expect("accept retry probe");
+            second
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                .expect("write health response");
+        });
+
+        probe_trusted_health_with_retry(&address).expect("retry probe succeeds");
+        server.join().expect("health stub thread");
+    }
+
+    #[test]
+    fn trusted_health_probe_fails_when_gateway_stays_dead() {
+        use std::net::TcpListener;
+
+        // Bind then drop so the port is closed: both attempts must be refused.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind throwaway port");
+        let address = listener
+            .local_addr()
+            .expect("throwaway address")
+            .to_string();
+        drop(listener);
+
+        let error = probe_trusted_health_with_retry(&address)
+            .expect_err("dead gateway must still open the circuit");
+        assert_eq!(error, "trusted Context Engine is unreachable");
     }
 }
