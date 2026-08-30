@@ -858,9 +858,9 @@ struct TrustedHarnessSpec {
 const GABE_NODE_PATH: &str = "/Users/gabriel/.buzz/RUNTIME/trusted-node/d36b3d980963d44bd2c5e844fac4cfeee26a167b744287a4e74a9575af9d0559/node";
 const GABE_NODE_SHA256: &str = "d36b3d980963d44bd2c5e844fac4cfeee26a167b744287a4e74a9575af9d0559";
 const GABE_ADAPTER_SHA256: &str =
-    "13c01b0fe460c8be222307bff90656db4d11932d9e61b0eb219dd98d0f323621";
-const GABE_ADAPTER_PATH: &str = "/Users/gabriel/.buzz/RUNTIME/context-engine/13c01b0fe460c8be222307bff90656db4d11932d9e61b0eb219dd98d0f323621/scripts/gabe-acp.mjs";
-const STACY_ADAPTER_PATH: &str = "/Users/gabriel/.buzz/RUNTIME/stacy-context-engine/13c01b0fe460c8be222307bff90656db4d11932d9e61b0eb219dd98d0f323621/scripts/gabe-acp.mjs";
+    "96a8efaf20cbc1cb92fb2ae2eca5a0bdefabba42f9cd6e2ca21299c724bd7c5c";
+const GABE_ADAPTER_PATH: &str = "/Users/gabriel/.buzz/RUNTIME/context-engine/96a8efaf20cbc1cb92fb2ae2eca5a0bdefabba42f9cd6e2ca21299c724bd7c5c/scripts/gabe-acp.mjs";
+const STACY_ADAPTER_PATH: &str = "/Users/gabriel/.buzz/RUNTIME/stacy-context-engine/96a8efaf20cbc1cb92fb2ae2eca5a0bdefabba42f9cd6e2ca21299c724bd7c5c/scripts/gabe-acp.mjs";
 
 const GABE_ARGS: &[&str] = &[GABE_ADAPTER_PATH];
 const STACY_ARGS: &[&str] = &[STACY_ADAPTER_PATH];

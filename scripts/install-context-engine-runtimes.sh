@@ -11,7 +11,7 @@ readonly trusted_build_root="/Users/gabriel/.buzz/REPOS/.trusted-build/buzz-acp"
 readonly runtime_root="/Users/gabriel/.buzz/RUNTIME"
 readonly node_source="/Users/gabriel/.nvm/versions/node/v24.13.1/bin/node"
 readonly node_sha256="d36b3d980963d44bd2c5e844fac4cfeee26a167b744287a4e74a9575af9d0559"
-readonly adapter_sha256="13c01b0fe460c8be222307bff90656db4d11932d9e61b0eb219dd98d0f323621"
+readonly adapter_sha256="96a8efaf20cbc1cb92fb2ae2eca5a0bdefabba42f9cd6e2ca21299c724bd7c5c"
 
 [[ $# -eq 4 ]] || {
   printf 'FATAL: usage: install-context-engine-runtimes.sh <buzz-commit> <gabe-commit> <stacy-commit> <buzz-acp-sha256>\n' >&2
