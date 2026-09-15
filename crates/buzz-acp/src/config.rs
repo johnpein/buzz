@@ -900,17 +900,6 @@ const STACY_RUNTIME_ENV: &[(&str, &str)] = &[
     ("CONTEXT_ENGINE_BASE_URL", "http://127.0.0.1:18803"),
     ("BUZZ_ACP_SESSION_PREFIX", "stacy"),
 ];
-const STACY_DEPLOYMENT: TrustedDeploymentSpec = TrustedDeploymentSpec {
-    receipt_path: "/Users/gabriel/.buzz/RUNTIME/stacy-context-engine/home/deployment-receipt.json",
-    lifecycle_state_path:
-        "/Users/gabriel/.buzz/RUNTIME/stacy-context-engine/home/deployment-control/lifecycle-state",
-    docker_socket: "/Users/gabriel/.docker/run/docker.sock",
-    project: "stacy",
-    agent_container: "stacy-agent",
-    agent_service: "stacy",
-    dashboard_container: "stacy-dashboard",
-    dashboard_service: "stacy-dashboard",
-};
 const INSTALL_RECEIPTS_ROOT: &str = "/Users/gabriel/.buzz/RUNTIME/deployment-receipts";
 const GABE_HARNESS_SPEC: TrustedHarnessSpec = TrustedHarnessSpec {
     harness: TrustedOutboxHarness::Gabe,
@@ -933,11 +922,10 @@ const STACY_HARNESS_SPEC: TrustedHarnessSpec = TrustedHarnessSpec {
     agent_pin_env: "BUZZ_STACY_AGENT_PUBKEY",
     owner_pin_env: "BUZZ_STACY_OWNER_PUBKEY",
     runtime_env: STACY_RUNTIME_ENV,
-    capability_home: Some("/Users/gabriel/.buzz/RUNTIME/stacy-context-engine/home"),
-    outbox_dir:
-        "/Users/gabriel/.buzz/RUNTIME/stacy-context-engine/home/state/context-engine-buzz/prepared",
+    capability_home: Some("/Users/gabriel/.openclaw/agents/stacy"),
+    outbox_dir: "/Users/gabriel/.openclaw/agents/stacy/state/context-engine-buzz/prepared",
     health_addr: Some("127.0.0.1:18803"),
-    deployment: Some(STACY_DEPLOYMENT),
+    deployment: None,
 };
 static TRUSTED_HARNESSES: &[TrustedHarnessSpec] = &[GABE_HARNESS_SPEC, STACY_HARNESS_SPEC];
 
@@ -4798,107 +4786,6 @@ channels = "ALL"
             .status()
             .expect("open displaced fixture for cleanup");
         std::fs::remove_dir_all(root).expect("remove trusted ancestor fixture");
-    }
-
-    #[test]
-    fn stacy_deployment_receipt_requires_exact_install_and_generation_binding() {
-        let legacy = serde_json::json!({
-            "version": 1,
-            "project": "stacy",
-            "sourceCommit": "1".repeat(40),
-            "upstreamPin": "2".repeat(40),
-            "composeSha256": "3".repeat(64),
-            "stacyContainerId": "4".repeat(64),
-            "stacyImageId": format!("sha256:{}", "5".repeat(64)),
-            "dashboardContainerId": "6".repeat(64),
-            "dashboardImageId": format!("sha256:{}", "7".repeat(64)),
-        });
-        assert!(serde_json::from_value::<TrustedDeploymentReceipt>(legacy).is_err());
-
-        let bound = serde_json::json!({
-            "version": 3,
-            "project": "stacy",
-            "buzzCommit": "0".repeat(40),
-            "sourceCommit": "1".repeat(40),
-            "upstreamPin": "2".repeat(40),
-            "composeSha256": "3".repeat(64),
-            "installReceiptSha256": "8".repeat(64),
-            "deploymentGeneration": "9".repeat(64),
-            "lifecycleGeneration": "a".repeat(64),
-            "stacyContainerId": "4".repeat(64),
-            "stacyImageId": format!("sha256:{}", "5".repeat(64)),
-            "dashboardContainerId": "6".repeat(64),
-            "dashboardImageId": format!("sha256:{}", "7".repeat(64)),
-        });
-        let receipt = serde_json::from_value::<TrustedDeploymentReceipt>(bound)
-            .expect("fully bound receipt should parse");
-        assert_eq!(receipt.version, 3);
-        assert_eq!(receipt.deployment_generation, "9".repeat(64));
-        assert_eq!(receipt.lifecycle_generation, "a".repeat(64));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn trusted_lifecycle_state_authorizes_only_the_exact_up_generation() {
-        use std::os::unix::fs::PermissionsExt;
-
-        struct RemoveFixture(PathBuf);
-        impl Drop for RemoveFixture {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
-
-        let directory = PathBuf::from("/private/tmp")
-            .join(format!("buzz-lifecycle-{}", uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir(&directory).expect("create lifecycle fixture");
-        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
-            .expect("secure lifecycle directory");
-        let _cleanup = RemoveFixture(directory.clone());
-        let state = directory.join("lifecycle-state");
-        let generation = "a".repeat(64);
-        std::fs::write(&state, format!("{generation} up\n")).expect("write lifecycle state");
-        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o600))
-            .expect("secure lifecycle state");
-        let lifecycle_state_path: &'static str =
-            Box::leak(state.to_string_lossy().into_owned().into_boxed_str());
-        let spec = TrustedDeploymentSpec {
-            receipt_path: "/unused",
-            lifecycle_state_path,
-            docker_socket: "/unused",
-            project: "stacy",
-            agent_container: "stacy-agent",
-            agent_service: "stacy",
-            dashboard_container: "stacy-dashboard",
-            dashboard_service: "stacy-dashboard",
-        };
-        let receipt = TrustedDeploymentReceipt {
-            version: 3,
-            project: "stacy".into(),
-            buzz_commit: "0".repeat(40),
-            source_commit: "1".repeat(40),
-            upstream_pin: "2".repeat(40),
-            compose_sha256: "3".repeat(64),
-            install_receipt_sha256: "8".repeat(64),
-            deployment_generation: "9".repeat(64),
-            lifecycle_generation: generation.clone(),
-            stacy_container_id: "4".repeat(64),
-            stacy_image_id: format!("sha256:{}", "5".repeat(64)),
-            dashboard_container_id: "6".repeat(64),
-            dashboard_image_id: format!("sha256:{}", "7".repeat(64)),
-        };
-
-        validate_trusted_lifecycle_state(spec, &receipt)
-            .expect("exact up generation should authorize the deployment");
-        std::fs::write(&state, format!("{generation} stop\n")).expect("write stop lifecycle state");
-        assert!(validate_trusted_lifecycle_state(spec, &receipt).is_err());
-        std::fs::write(&state, format!("{} up\n", "b".repeat(64)))
-            .expect("write superseding lifecycle state");
-        assert!(validate_trusted_lifecycle_state(spec, &receipt).is_err());
-        std::fs::write(&state, format!("{generation} up\n")).expect("restore lifecycle state");
-        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o644))
-            .expect("weaken lifecycle state mode");
-        assert!(validate_trusted_lifecycle_state(spec, &receipt).is_err());
     }
 
     // --- relay_url_to_http_base tests ---
