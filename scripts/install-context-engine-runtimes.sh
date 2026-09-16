@@ -6,22 +6,22 @@ umask 077
 
 readonly buzz_root="/Users/gabriel/.buzz/REPOS/buzz"
 readonly gabe_root="/Users/gabriel/.openclaw"
-readonly stacy_root="/Users/gabriel/stacy"
+# Stacy runs co-located on the same OpenClaw checkout; her home is a subtree.
+readonly stacy_home="$gabe_root/agents/stacy"
 readonly trusted_build_root="/Users/gabriel/.buzz/REPOS/.trusted-build/buzz-acp"
 readonly runtime_root="/Users/gabriel/.buzz/RUNTIME"
 readonly node_source="/Users/gabriel/.nvm/versions/node/v24.13.1/bin/node"
 readonly node_sha256="d36b3d980963d44bd2c5e844fac4cfeee26a167b744287a4e74a9575af9d0559"
 readonly adapter_sha256="66c483860a4687ef064be0428450aab2f1ab059043d478e4d955552defa81e5c"
 
-[[ $# -eq 4 ]] || {
-  printf 'FATAL: usage: install-context-engine-runtimes.sh <buzz-commit> <gabe-commit> <stacy-commit> <buzz-acp-sha256>\n' >&2
+[[ $# -eq 3 ]] || {
+  printf 'FATAL: usage: install-context-engine-runtimes.sh <buzz-commit> <openclaw-commit> <buzz-acp-sha256>\n' >&2
   exit 1
 }
 readonly approved_buzz_commit="$1"
 readonly approved_gabe_commit="$2"
-readonly approved_stacy_commit="$3"
-readonly buzz_acp_sha256="$4"
-for digest in "$approved_buzz_commit:40" "$approved_gabe_commit:40" "$approved_stacy_commit:40" "$buzz_acp_sha256:64"; do
+readonly buzz_acp_sha256="$3"
+for digest in "$approved_buzz_commit:40" "$approved_gabe_commit:40" "$buzz_acp_sha256:64"; do
   value="${digest%:*}"
   length="${digest##*:}"
   [[ ${#value} -eq $length && "$value" =~ ^[0-9a-f]+$ ]] || {
@@ -163,16 +163,11 @@ ensure_private_directory() {
 require_clean_main "$buzz_root" Buzz
 require_clean_main_pathspecs "$gabe_root" Gabe \
   extensions/context-engine extensions/shared package.json package-lock.json tsconfig.json
-require_clean_main_pathspecs "$stacy_root" Stacy \
-  extensions/context-engine extensions/shared docker package.json package-lock.json tsconfig.json UPSTREAM_PIN
 
 readonly gabe_adapter="$gabe_root/extensions/context-engine/scripts/gabe-acp.mjs"
-readonly stacy_adapter="$stacy_root/extensions/context-engine/scripts/gabe-acp.mjs"
 
 verify_sha256 "$node_source" "$node_sha256"
-for adapter in "$gabe_adapter" "$stacy_adapter"; do
-  verify_sha256 "$adapter" "$adapter_sha256"
-done
+verify_sha256 "$gabe_adapter" "$adapter_sha256"
 
 # Building is deliberately outside this privileged installer. Running Cargo or
 # Hermit here would consume user/repository tool configuration and turn a
@@ -201,39 +196,14 @@ verify_sha256 "$buzz_acp_source" "$buzz_acp_sha256"
 
 buzz_commit="$(run_git "$buzz_root" rev-parse HEAD)"
 gabe_commit="$(run_git "$gabe_root" rev-parse HEAD)"
-stacy_commit="$(run_git "$stacy_root" rev-parse HEAD)"
-[[ "$buzz_commit" == "$approved_buzz_commit" && "$gabe_commit" == "$approved_gabe_commit" && "$stacy_commit" == "$approved_stacy_commit" ]] || {
+[[ "$buzz_commit" == "$approved_buzz_commit" && "$gabe_commit" == "$approved_gabe_commit" ]] || {
   printf 'FATAL: landed commits do not match the operator-approved install identities\n' >&2
   exit 1
 }
-stacy_upstream_pin="$(/usr/bin/env -i HOME=/var/empty PATH=/usr/bin:/bin /usr/bin/plutil -extract sha raw -expect string "$stacy_root/UPSTREAM_PIN" 2>/dev/null)" || {
-  printf 'FATAL: Stacy UPSTREAM_PIN is missing or malformed\n' >&2
-  exit 1
-}
-run_git "$gabe_root" cat-file -e "$stacy_upstream_pin^{commit}" 2>/dev/null && \
-  run_git "$stacy_root" cat-file -e "$stacy_upstream_pin^{commit}" 2>/dev/null || {
-  printf 'FATAL: Stacy UPSTREAM_PIN commit is unavailable in a canonical checkout\n' >&2
-  exit 1
-}
-run_git "$gabe_root" merge-base --is-ancestor "$stacy_upstream_pin" "$gabe_commit" || {
-  printf 'FATAL: Stacy UPSTREAM_PIN is not an ancestor of the landed Gabe commit\n' >&2
-  exit 1
-}
-readonly -a shared_runtime_pathspecs=(
-  extensions/context-engine
-  extensions/shared
-  package.json
-  package-lock.json
-  tsconfig.json
-)
-run_git "$gabe_root" diff --quiet --no-ext-diff "$stacy_upstream_pin" "$gabe_commit" -- "${shared_runtime_pathspecs[@]}" && \
-  run_git "$stacy_root" diff --quiet --no-ext-diff "$stacy_upstream_pin" "$stacy_commit" -- "${shared_runtime_pathspecs[@]}" || {
-  printf 'FATAL: landed Gabe or Stacy shared runtime bytes diverge from Stacy UPSTREAM_PIN\n' >&2
-  exit 1
-}
-# The pin is the exact provenance of the shared runtime bytes. A later approved
-# Gabe HEAD may differ only outside the guarded shared-runtime pathspecs above.
-readonly receipt_root="$runtime_root/deployment-receipts/$buzz_commit-$stacy_upstream_pin-$stacy_commit"
+# Both trusted context engines run the same shared runtime bytes from the one
+# OpenClaw checkout, so the receipt records that commit for Gabe and Stacy.
+stacy_commit="$gabe_commit"
+readonly receipt_root="$runtime_root/deployment-receipts/$buzz_commit-$gabe_commit-$stacy_commit"
 readonly deployment_control_root="$runtime_root/deployment-control"
 readonly install_lock="$deployment_control_root/install.lock"
 readonly -a code_namespaces=(
@@ -269,7 +239,6 @@ require_context_engine_quiescence() {
     [[ -n "${pid:-}" && -n "${command:-}" ]] || continue
     case "$command" in
       "$node_source $gabe_adapter"|"$node_source $gabe_adapter "*|\
-      "$node_source $stacy_adapter"|"$node_source $stacy_adapter "*|\
       "$runtime_root"/trusted-node/*/node\ "$runtime_root"/context-engine/*/scripts/gabe-acp.mjs|\
       "$runtime_root"/trusted-node/*/node\ "$runtime_root"/context-engine/*/scripts/gabe-acp.mjs\ *|\
       "$runtime_root"/trusted-node/*/node\ "$runtime_root"/stacy-context-engine/*/scripts/gabe-acp.mjs|\
@@ -540,7 +509,7 @@ stage_context_runtime() {
 }
 
 stage_context_runtime "$gabe_root" gabe-context
-stage_context_runtime "$stacy_root" stacy-context
+stage_context_runtime "$gabe_root" stacy-context
 
 /bin/mkdir -p "$stage/trusted-node" "$stage/buzz-acp"
 /bin/cp "$node_source" "$stage/trusted-node/node"
@@ -550,7 +519,7 @@ verify_sha256 "$stage/buzz-acp/buzz-acp" "$buzz_acp_sha256"
 
 /bin/mkdir -p "$stage/receipt"
 /usr/bin/printf '%s\n' \
-  "{\"buzzCommit\":\"$buzz_commit\",\"gabeCommit\":\"$stacy_upstream_pin\",\"stacyCommit\":\"$stacy_commit\",\"nodeSha256\":\"$node_sha256\",\"buzzAcpSha256\":\"$buzz_acp_sha256\",\"adapterSha256\":\"$adapter_sha256\"}" \
+  "{\"buzzCommit\":\"$buzz_commit\",\"gabeCommit\":\"$gabe_commit\",\"stacyCommit\":\"$stacy_commit\",\"nodeSha256\":\"$node_sha256\",\"buzzAcpSha256\":\"$buzz_acp_sha256\",\"adapterSha256\":\"$adapter_sha256\"}" \
   >"$stage/receipt/context-engine-runtimes.json"
 
 require_context_engine_quiescence
@@ -563,26 +532,15 @@ install_or_reuse_tree "$stage/gabe-context" "$runtime_root/context-engine/$adapt
 install_or_reuse_tree "$stage/stacy-context" "$runtime_root/stacy-context-engine/$adapter_sha256" adapter
 install_or_reuse_tree "$stage/receipt" "$receipt_root" receipt
 
-# Stacy's gateway writes only the opaque adapter capability into this private,
-# non-immutable directory. The adapter is transport-only and never writes here.
-readonly stacy_runtime_parent="$runtime_root/stacy-context-engine"
-readonly stacy_runtime_home="$stacy_runtime_parent/home"
-readonly stacy_credentials="$stacy_runtime_home/credentials"
-[[ -d "$stacy_runtime_parent" && ! -L "$stacy_runtime_parent" && "$(/bin/realpath "$stacy_runtime_parent")" == "$stacy_runtime_parent" ]] || {
-  printf 'FATAL: Stacy runtime parent is unsafe\n' >&2
+# Stacy's gateway writes only the opaque adapter capability into her private,
+# co-located home. The adapter is transport-only and never writes here.
+readonly stacy_credentials="$stacy_home/credentials"
+[[ -d "$stacy_home" && ! -L "$stacy_home" && "$(/bin/realpath "$stacy_home")" == "$stacy_home" ]] || {
+  printf 'FATAL: Stacy home is unsafe\n' >&2
   exit 1
 }
-if [[ -e "$stacy_runtime_home" || -L "$stacy_runtime_home" ]]; then
-  [[ -d "$stacy_runtime_home" && ! -L "$stacy_runtime_home" && "$(/bin/realpath "$stacy_runtime_home")" == "$stacy_runtime_home" ]] || {
-    printf 'FATAL: Stacy runtime home is unsafe\n' >&2
-    exit 1
-  }
-else
-  /bin/mkdir "$stacy_runtime_home"
-fi
-/bin/chmod 700 "$stacy_runtime_home"
-[[ "$(/usr/bin/stat -f '%u:%Lp' "$stacy_runtime_home")" == "$(/usr/bin/id -u):700" ]] || {
-  printf 'FATAL: Stacy runtime home owner or mode is unsafe\n' >&2
+[[ "$(/usr/bin/stat -f '%u:%Lp' "$stacy_home")" == "$(/usr/bin/id -u):700" ]] || {
+  printf 'FATAL: Stacy home owner or mode is unsafe\n' >&2
   exit 1
 }
 ensure_private_directory "$stacy_credentials"
@@ -597,9 +555,13 @@ readonly gabe_state_root="$gabe_root/state"
 }
 ensure_private_directory "$gabe_state_root/context-engine-buzz"
 ensure_private_directory "$gabe_state_root/context-engine-buzz/prepared"
-ensure_private_directory "$stacy_runtime_home/state"
-ensure_private_directory "$stacy_runtime_home/state/context-engine-buzz"
-ensure_private_directory "$stacy_runtime_home/state/context-engine-buzz/prepared"
+readonly stacy_state_root="$stacy_home/state"
+[[ -d "$stacy_state_root" && ! -L "$stacy_state_root" && "$(/bin/realpath "$stacy_state_root")" == "$stacy_state_root" ]] || {
+  printf 'FATAL: Stacy state root is unsafe\n' >&2
+  exit 1
+}
+ensure_private_directory "$stacy_state_root/context-engine-buzz"
+ensure_private_directory "$stacy_state_root/context-engine-buzz/prepared"
 
 for namespace in "${code_namespaces[@]}"; do
   freeze_runtime_namespace "$namespace" || {
