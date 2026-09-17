@@ -2173,6 +2173,95 @@ async fn author_type_label(
     }
 }
 
+/// Enforce the group-chat floor lease for a kind:9 (stream message) publish.
+///
+/// Thin I/O wiring over the pure [`crate::floor::evaluate_floor_at_ingest`]
+/// decision (`crates/buzz-relay/src/floor.rs`): resolve the real channel type,
+/// the channel roster, and which roster members are agents
+/// (`users.agent_owner_pubkey IS NOT NULL` — the same signal as
+/// [`author_type_label`] and buzz-acp's NIP-OA sibling gate), then consult the
+/// channel's cached [`crate::floor::FloorLease`]. Non-stream channels return
+/// early without even loading the roster, so ordinary DMs are byte-unaffected.
+/// A publish by an agent that does not hold the floor is rejected through the
+/// same [`IngestError::Rejected`] surface the membership-revision CAS check
+/// uses, so buzz-acp's existing publish-rejection back-off/requeue handles it.
+async fn enforce_floor_lease(
+    state: &Arc<AppState>,
+    tenant: &TenantContext,
+    channel_id: Uuid,
+    channel_row: Option<&buzz_db::channel::ChannelRecord>,
+    author: &nostr::PublicKey,
+) -> Result<(), IngestError> {
+    use buzz_db::channel::ChannelType;
+    use buzz_sdk::broker::PubkeyHex;
+
+    // Authoritative enforcement gate (design requirement 1): only stream
+    // channels are floor-enforced. DMs/forums bypass before any roster load.
+    let is_stream = channel_row
+        .and_then(|row| row.channel_type.parse::<ChannelType>().ok())
+        == Some(ChannelType::Stream);
+    if !is_stream {
+        return Ok(());
+    }
+
+    let members = state
+        .db
+        .get_members(tenant.community(), channel_id)
+        .await
+        .map_err(|e| IngestError::Internal(format!("error: floor roster load: {e}")))?;
+
+    // Resolve which roster members are agents, reusing the cached agent signal.
+    let mut agent_pubkeys = Vec::new();
+    for member in &members {
+        if author_type_label(state, tenant, member.pubkey.clone()).await == "agent" {
+            if let Ok(hex) = PubkeyHex::parse(hex::encode(&member.pubkey)) {
+                agent_pubkeys.push(hex);
+            }
+        }
+    }
+
+    let Ok(author_hex) = PubkeyHex::parse(author.to_hex()) else {
+        // Unparseable author: leave ingest untouched rather than add a failure
+        // path (the author already passed signature + identity checks upstream).
+        return Ok(());
+    };
+
+    // Get-or-create this channel's lease over the current agent set. On an
+    // existing entry the init closure is not run, so a lease created earlier is
+    // reused (its rotation may lag a since-changed roster — see report concern).
+    let lease = state
+        .floor_leases
+        .get_with((tenant.community(), channel_id), || {
+            Arc::new(std::sync::Mutex::new(crate::floor::FloorLease::new(
+                agent_pubkeys.clone(),
+                crate::floor::DEFAULT_FLOOR_TTL,
+                crate::floor::DEFAULT_FLOOR_BUDGET,
+            )))
+        });
+
+    let action = {
+        // Synchronous decision; this guard never spans an `.await`.
+        let mut guard = lease.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::floor::evaluate_floor_at_ingest(
+            ChannelType::Stream,
+            &members,
+            &agent_pubkeys,
+            &author_hex,
+            &mut guard,
+            std::time::Instant::now(),
+        )
+    };
+
+    match action {
+        crate::floor::IngestFloorAction::Rejected(_) => Err(IngestError::Rejected(
+            "restricted: floor held by another agent".into(),
+        )),
+        crate::floor::IngestFloorAction::Bypass
+        | crate::floor::IngestFloorAction::Opened
+        | crate::floor::IngestFloorAction::Published(_) => Ok(()),
+    }
+}
+
 /// Ingest a signed Nostr event through the full validation pipeline.
 ///
 /// Shared by WebSocket and HTTP transports. The caller constructs [`IngestAuth`]
@@ -2641,6 +2730,17 @@ async fn ingest_event_inner(
                 state_for_request(tenant, auth.pubkey()),
             );
             auth_result.map_err(IngestError::Rejected)?;
+        }
+    }
+
+    // Group-chat floor lease: in a multi-agent stream, serialize agent kind:9
+    // replies so only the current floor-holder is accepted. Owner messages
+    // reopen the floor; a stalled holder is reclaimed on the lease TTL. Thin
+    // wiring over the pure `crate::floor` decision; non-stream channels bypass
+    // untouched (the helper returns early before any roster load).
+    if kind_u32 == KIND_STREAM_MESSAGE {
+        if let Some(ch_id) = channel_id {
+            enforce_floor_lease(state, tenant, ch_id, channel_row.as_ref(), auth.pubkey()).await?;
         }
     }
 

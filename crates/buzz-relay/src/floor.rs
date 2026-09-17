@@ -10,8 +10,19 @@
 
 use std::time::{Duration, Instant};
 
+use buzz_core::channel::ChannelType;
 use buzz_sdk::broker::PubkeyHex;
 use thiserror::Error;
+
+/// Default TTL on a held floor when the relay creates a channel's lease. A
+/// stalled holder's floor is reclaimable after this window (see
+/// [`FloorLease::reclaim_if_expired`]).
+pub const DEFAULT_FLOOR_TTL: Duration = Duration::from_secs(30);
+
+/// Default per-owner-turn agent budget when the relay creates a channel's
+/// lease: how many agent replies may follow one owner message before the floor
+/// closes until the owner speaks again.
+pub const DEFAULT_FLOOR_BUDGET: u32 = 8;
 
 /// Whether a channel's roster should have the group-chat floor lease
 /// ([`FloorLease`]) enforced at all.
@@ -195,6 +206,82 @@ impl FloorLease {
     #[must_use]
     pub fn current_holder(&self) -> Option<&PubkeyHex> {
         self.holder.as_ref()
+    }
+}
+
+/// Outcome of consulting the floor for a kind:9 (stream message) at ingest.
+///
+/// Returned by [`evaluate_floor_at_ingest`]; the ingest wiring maps
+/// [`Rejected`](Self::Rejected) onto the relay's existing publish-rejection
+/// path and treats every other variant as "store the event".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IngestFloorAction {
+    /// The channel is not floor-enforced (not a multi-agent stream). Ingest
+    /// proceeds exactly as it would without the floor — the lease is untouched.
+    Bypass,
+    /// A non-agent (owner/human) message: the floor was opened and the agent
+    /// budget reset. Accept.
+    Opened,
+    /// The publishing agent held the floor; its turn was recorded and the floor
+    /// released. Accept. Carries the next agent round-robin would grant (unused
+    /// at ingest today — the grant path is driven out of band).
+    Published(NextGrant),
+    /// The publishing agent did not hold the floor. Reject via the relay's
+    /// existing publish-rejection surface.
+    Rejected(FloorError),
+}
+
+/// Decide how a kind:9 publish should be handled against the channel's floor.
+///
+/// This is the whole floor decision the relay's ingest path runs once it has
+/// resolved the real channel type, the channel roster, and which roster members
+/// are agents (`agent_pubkeys`, resolved caller-side from
+/// `users.agent_owner_pubkey`, the same signal the NIP-OA sibling gate uses).
+/// It is pure and deterministic — all clock access is the caller-supplied
+/// `now` — so the ingest wiring stays thin glue over this function.
+///
+/// The authoritative enforcement gate is the channel type: only a
+/// [`ChannelType::Stream`] that is also [`is_floor_enforced`] is gated; every
+/// other channel (DMs, forums, single-agent streams) returns
+/// [`IngestFloorAction::Bypass`] without touching `lease`. Within an enforced
+/// stream, a non-agent author's message opens the floor
+/// ([`FloorLease::on_owner_message`]) and an agent author must hold the floor
+/// ([`FloorLease::on_publish`]) or be rejected. `reclaim_if_expired` is applied
+/// opportunistically first so a stalled holder never wedges the channel.
+///
+/// An agent author that is not part of the lease's rotation surfaces as
+/// [`FloorError::NotHolder`] from `on_publish` (it can never be the holder), so
+/// no distinct unknown-agent error is needed here.
+#[must_use]
+pub fn evaluate_floor_at_ingest(
+    channel_type: ChannelType,
+    members: &[buzz_db::channel_members::MemberRecord],
+    agent_pubkeys: &[PubkeyHex],
+    author: &PubkeyHex,
+    lease: &mut FloorLease,
+    now: Instant,
+) -> IngestFloorAction {
+    // Authoritative gate (design requirement 1): only multi-agent streams are
+    // floor-enforced. `is_floor_enforced`'s member-count rule is the secondary
+    // guard behind this channel-type check.
+    if channel_type != ChannelType::Stream || !is_floor_enforced(members, agent_pubkeys) {
+        return IngestFloorAction::Bypass;
+    }
+
+    // Opportunistic reclaim: a held-but-expired floor is released before this
+    // publish is judged, so a stalled holder cannot lock the channel forever.
+    lease.reclaim_if_expired(now);
+
+    let author_is_agent = agent_pubkeys.iter().any(|agent| agent == author);
+    if !author_is_agent {
+        // A non-agent (the human owner) speaking reopens the floor for agents.
+        lease.on_owner_message(now);
+        return IngestFloorAction::Opened;
+    }
+
+    match lease.on_publish(author, now) {
+        Ok(next) => IngestFloorAction::Published(next),
+        Err(error) => IngestFloorAction::Rejected(error),
     }
 }
 

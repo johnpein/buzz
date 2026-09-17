@@ -95,3 +95,133 @@ fn floor_enforced_false_for_two_agent_roster_with_no_owner() {
         &[gabe(), stacy()],
     ));
 }
+
+// --- Task 3: floor enforcement at the ingest seam --------------------------
+//
+// [`buzz_relay::floor::evaluate_floor_at_ingest`] is the pure decision the
+// relay's kind:9 ingest path runs after it has resolved the real channel type,
+// the channel roster, and which roster members are agents. Driving it here with
+// a realistic owner+gabe+stacy `Stream` roster exercises the exact branch the
+// ingest wiring calls (gate on `ChannelType::Stream` + `is_floor_enforced`,
+// classify owner-vs-agent author, consult the per-channel `FloorLease`) without
+// standing up a Postgres-backed relay. The DB reads the ingest wiring performs
+// (`get_channel`, `get_members`, `get_agent_channel_policy`) are plain plumbing
+// over that decision, wired in `enforce_floor_lease` in the ingest handler.
+
+use std::time::{Duration, Instant};
+
+use buzz_core::channel::ChannelType;
+use buzz_relay::floor::{evaluate_floor_at_ingest, FloorDecision, FloorLease, IngestFloorAction};
+
+#[test]
+fn floor_enforced_at_ingest_gates_agent_kind9_publishes() {
+    use MemberRole::{Member, Owner};
+
+    let members = roster(&[(owner(), Owner), (gabe(), Member), (stacy(), Member)]);
+    let agents = [gabe(), stacy()];
+    let mut lease = FloorLease::new(vec![gabe(), stacy()], Duration::from_secs(30), 8);
+    let now = Instant::now();
+
+    // 1. gabe (an agent) publishes kind:9 without holding the floor → rejected.
+    assert!(
+        matches!(
+            evaluate_floor_at_ingest(
+                ChannelType::Stream,
+                &members,
+                &agents,
+                &gabe(),
+                &mut lease,
+                now
+            ),
+            IngestFloorAction::Rejected(_)
+        ),
+        "agent publish with no held floor must be rejected",
+    );
+
+    // 2. The owner (a non-agent) publishes → accepted, and the floor opens.
+    assert_eq!(
+        evaluate_floor_at_ingest(ChannelType::Stream, &members, &agents, &owner(), &mut lease, now),
+        IngestFloorAction::Opened,
+        "owner message must open the floor and be accepted",
+    );
+
+    // 3. gabe requests the floor (the grant path is driven out of band, not at
+    //    ingest) and is granted, then publishes → accepted.
+    assert_eq!(lease.request(&gabe(), now), FloorDecision::Granted);
+    assert!(
+        matches!(
+            evaluate_floor_at_ingest(
+                ChannelType::Stream,
+                &members,
+                &agents,
+                &gabe(),
+                &mut lease,
+                now
+            ),
+            IngestFloorAction::Published(_)
+        ),
+        "the floor holder's publish must be accepted",
+    );
+
+    // 4. stacy publishes at the same instant without ever being granted → rejected.
+    assert!(
+        matches!(
+            evaluate_floor_at_ingest(
+                ChannelType::Stream,
+                &members,
+                &agents,
+                &stacy(),
+                &mut lease,
+                now
+            ),
+            IngestFloorAction::Rejected(_)
+        ),
+        "a non-holder agent publish must be rejected even right after the holder released",
+    );
+}
+
+#[test]
+fn dm_and_non_enforced_channels_bypass_the_floor_untouched() {
+    use MemberRole::{Member, Owner};
+
+    let now = Instant::now();
+    let mut lease = FloorLease::new(vec![gabe(), stacy()], Duration::from_secs(30), 8);
+
+    // A real DM (owner + single agent) bypasses regardless of the roster: the
+    // authoritative gate is the channel type, not the member-count heuristic.
+    let dm = roster(&[(owner(), Owner), (gabe(), Member)]);
+    assert_eq!(
+        evaluate_floor_at_ingest(ChannelType::Dm, &dm, &[gabe()], &gabe(), &mut lease, now),
+        IngestFloorAction::Bypass,
+        "a DM ingest path must be byte-unaffected by the floor",
+    );
+
+    // Even a multi-agent roster in a Dm-typed channel bypasses outright.
+    let multi = roster(&[(owner(), Owner), (gabe(), Member), (stacy(), Member)]);
+    assert_eq!(
+        evaluate_floor_at_ingest(
+            ChannelType::Dm,
+            &multi,
+            &[gabe(), stacy()],
+            &gabe(),
+            &mut lease,
+            now
+        ),
+        IngestFloorAction::Bypass,
+        "channel type Dm is the authoritative exclusion",
+    );
+
+    // A Stream channel that is not floor-enforced (a single agent) also bypasses.
+    assert_eq!(
+        evaluate_floor_at_ingest(ChannelType::Stream, &dm, &[gabe()], &gabe(), &mut lease, now),
+        IngestFloorAction::Bypass,
+        "a non-enforced stream bypasses the floor",
+    );
+
+    // Proof the bypass never touched the lease: no holder was set and no owner
+    // message was recorded, so agents still cannot publish through it.
+    assert!(
+        lease.current_holder().is_none(),
+        "bypass paths must not mutate the channel's floor lease",
+    );
+}

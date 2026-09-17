@@ -757,6 +757,19 @@ pub struct AppState {
     /// so a short TTL only bounds staleness for the rare backfill race.
     pub author_type_cache: Arc<moka::sync::Cache<(CommunityId, Vec<u8>), bool>>,
 
+    /// Per-channel group-chat floor lease ([`crate::floor::FloorLease`]),
+    /// created lazily on the first floor-enforced kind:9 ingest for a channel
+    /// (see `crate::handlers::ingest`). Key: (community_id, channel_id).
+    ///
+    /// The map itself is a lock-free `moka` cache; each entry is an
+    /// `Arc<Mutex<FloorLease>>` so the ingest path clones the `Arc` out (a brief
+    /// cache-internal lock), then locks only that channel's lease to run the
+    /// synchronous floor decision — never held across an `.await`, and it takes
+    /// part in no other lock ordering.
+    #[allow(clippy::type_complexity)]
+    pub floor_leases:
+        Arc<moka::sync::Cache<(CommunityId, Uuid), Arc<std::sync::Mutex<crate::floor::FloorLease>>>>,
+
     /// Runtime conformance tracer. Production binds [`crate::conformance::NoopTracer`]
     /// (zero cost). Conformance tests bind [`crate::conformance::JsonlTracer`] to
     /// record traces for replay against `docs/spec/MultiTenantRelay.tla`.
@@ -937,6 +950,15 @@ impl AppState {
                 moka::sync::Cache::builder()
                     .max_capacity(10_000)
                     .time_to_live(std::time::Duration::from_secs(300))
+                    .build(),
+            ),
+            // Idle-evict a channel's floor lease after 30 min of no kind:9
+            // traffic; it is rebuilt from the current roster on the next
+            // enforced publish. Bounds memory across many short-lived channels.
+            floor_leases: Arc::new(
+                moka::sync::Cache::builder()
+                    .max_capacity(10_000)
+                    .time_to_idle(std::time::Duration::from_secs(1_800))
                     .build(),
             ),
             // Default to NoopTracer: production builds pay zero cost.
