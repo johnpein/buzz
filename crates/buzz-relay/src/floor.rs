@@ -13,6 +13,45 @@ use std::time::{Duration, Instant};
 use buzz_sdk::broker::PubkeyHex;
 use thiserror::Error;
 
+/// Whether a channel's roster should have the group-chat floor lease
+/// ([`FloorLease`]) enforced at all.
+///
+/// True iff at least two roster members are agents (their pubkey appears in
+/// `agent_pubkeys`) AND the channel is not a plain 2-party DM. A roster with
+/// exactly two entries is treated as a DM by construction — whether
+/// owner+agent or agent+agent — so the two-party case is excluded outright
+/// rather than merely implied by the agent count.
+///
+/// That two-party-is-a-DM rule is a documented assumption pending
+/// verification against the real channel-type model, not a proven invariant
+/// of this module. The ingest-wiring task (the next task in this sequence)
+/// will gate floor enforcement on the real `ChannelType::Stream` explicitly,
+/// rather than relying on this member-count heuristic alone.
+///
+/// Pure and caller-driven: resolving which members are agents (a NIP-OA
+/// profile lookup, mirroring `buzz-acp`'s `check_sibling_via_profile`) is the
+/// caller's job in the ingest-wiring task that drives this alongside
+/// `FloorLease`. No I/O happens here.
+#[must_use]
+pub fn is_floor_enforced(
+    members: &[buzz_db::channel_members::MemberRecord],
+    agent_pubkeys: &[PubkeyHex],
+) -> bool {
+    if members.len() <= 2 {
+        return false;
+    }
+    let agent_count = members
+        .iter()
+        .filter(|member| {
+            let member_hex = hex::encode(&member.pubkey);
+            agent_pubkeys
+                .iter()
+                .any(|agent| agent.as_str() == member_hex)
+        })
+        .count();
+    agent_count >= 2
+}
+
 /// Outcome of an agent's request to speak.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FloorDecision {

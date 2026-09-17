@@ -1,17 +1,17 @@
 //! Multi-agent channel detection for the group-chat floor lease (Task 2).
 //!
-//! [`buzz_relay::handlers::ingest::is_floor_enforced`] decides whether a
-//! channel's roster should have the floor lease (Task 1's
-//! [`buzz_relay::floor::FloorLease`]) enforced at all: only channels with two
-//! or more agent members, never an ordinary owner+single-agent DM. The
-//! agent-identity set is caller-resolved (NIP-OA profile lookups happen in
-//! the ingest-wiring task, not here) so this stays a pure roster-shape check.
+//! [`buzz_relay::floor::is_floor_enforced`] decides whether a channel's
+//! roster should have the floor lease ([`buzz_relay::floor::FloorLease`])
+//! enforced at all: only channels with two or more agent members, never an
+//! ordinary owner+single-agent DM. The agent-identity set is caller-resolved
+//! (NIP-OA profile lookups happen in the ingest-wiring task, not here) so
+//! this stays a pure roster-shape check.
 
 use chrono::Utc;
 use uuid::Uuid;
 
 use buzz_db::channel_members::{MemberRecord, MemberRole};
-use buzz_relay::handlers::ingest::is_floor_enforced;
+use buzz_relay::floor::is_floor_enforced;
 use buzz_sdk::broker::PubkeyHex;
 
 fn pubkey() -> PubkeyHex {
@@ -81,5 +81,17 @@ fn floor_enforced_only_with_two_or_more_agents() {
     assert!(!is_floor_enforced(
         &roster(&[(owner(), Owner), (bob(), Member), (ann(), Member)]),
         &[],
+    ));
+}
+
+#[test]
+fn floor_enforced_false_for_two_agent_roster_with_no_owner() {
+    use MemberRole::Member;
+
+    // 2 members, both agents, no owner: still a 2-party roster, so it falls
+    // out of the same `len() <= 2` short-circuit as an owner+agent DM.
+    assert!(!is_floor_enforced(
+        &roster(&[(gabe(), Member), (stacy(), Member)]),
+        &[gabe(), stacy()],
     ));
 }
