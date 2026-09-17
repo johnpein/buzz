@@ -20,6 +20,8 @@ pub mod conformance;
 pub mod connection;
 /// Relay error types.
 pub mod error;
+/// Pure floor-lease state machine serializing agent replies in group chat.
+pub mod floor;
 /// WebSocket message handlers for NIP-01 client commands.
 pub mod handlers;
 /// Stateless HMAC-signed relay invite tokens (mint/verify).
