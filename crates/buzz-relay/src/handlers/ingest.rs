@@ -78,6 +78,38 @@ fn expected_huddle_backing_ttl(ephemeral_ttl_override: Option<i32>) -> i32 {
     ephemeral_ttl_override.unwrap_or(3600)
 }
 
+/// Whether a channel's roster should have the group-chat floor lease
+/// ([`crate::floor::FloorLease`]) enforced at all.
+///
+/// True iff at least two roster members are agents (their pubkey appears in
+/// `agent_pubkeys`) AND the channel is not a plain 2-party DM. A roster with
+/// exactly two entries is always a DM by construction — whether owner+agent
+/// or agent+agent — so the two-party case is excluded outright rather than
+/// merely implied by the agent count.
+///
+/// Pure and caller-driven: resolving which members are agents (a NIP-OA
+/// profile lookup, mirroring `buzz-acp`'s `check_sibling_via_profile`) is the
+/// caller's job in the ingest-wiring task that drives this alongside
+/// `FloorLease`. No I/O happens here.
+pub fn is_floor_enforced(
+    members: &[buzz_db::channel_members::MemberRecord],
+    agent_pubkeys: &[buzz_sdk::broker::PubkeyHex],
+) -> bool {
+    if members.len() <= 2 {
+        return false;
+    }
+    let agent_count = members
+        .iter()
+        .filter(|member| {
+            let member_hex = hex::encode(&member.pubkey);
+            agent_pubkeys
+                .iter()
+                .any(|agent| agent.as_str() == member_hex)
+        })
+        .count();
+    agent_count >= 2
+}
+
 async fn validate_huddle_lifecycle_event(
     tenant: &TenantContext,
     state: &AppState,
