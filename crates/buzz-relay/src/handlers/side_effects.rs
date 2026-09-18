@@ -1,10 +1,13 @@
 //! NIP-29 and NIP-25 side-effect handlers.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use nostr::{Event, EventBuilder, Kind, Tag};
 use tracing::{info, warn};
 use uuid::Uuid;
+
+use buzz_sdk::broker::PubkeyHex;
 
 use buzz_core::kind::{
     event_kind_u32, is_parameterized_replaceable, KIND_AGENT_PROFILE, KIND_DM_VISIBILITY,
@@ -894,6 +897,71 @@ pub fn emit_live_thread_summary(
                 .local_event_ids
                 .invalidate(&(tenant.community(), event.id.to_bytes()));
             warn!(root = %root_hex, "live thread summary Redis publish failed: {e}");
+        }
+        let stored = StoredEvent::new(event, Some(channel_id));
+        crate::handlers::event::fan_out_event_to_local_subscribers(
+            &state,
+            tenant.community(),
+            &stored,
+        )
+        .await;
+    });
+}
+
+/// Sign and fan out a fresh relay-signed `kind:39007` floor-grant overlay
+/// naming `holder` as `channel_id`'s current [`crate::floor::FloorLease`]
+/// holder, after a `kind:20003` request is granted or a holder's publish
+/// hands the floor to the next agent in round-robin (see
+/// `crate::handlers::ingest::{handle_floor_request, enforce_floor_lease}`).
+///
+/// Fan-out only — never stored, the same "39xxx but never persisted"
+/// convention as [`emit_live_thread_summary`] (`KIND_THREAD_SUMMARY`). A
+/// client that was not subscribed at delivery time learns the current
+/// holder from its own next `FloorDecision` response rather than a durable
+/// replay of this event — a deliberate scope deferral, see the Task 4
+/// report.
+///
+/// Spawned so this never adds latency to the triggering request/publish's
+/// own accept path, matching `dispatch_persistent_event`/
+/// `emit_live_thread_summary`.
+pub fn emit_floor_grant(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    channel_id: Uuid,
+    holder: &PubkeyHex,
+    revision: u64,
+    ttl: Duration,
+) {
+    let tenant = tenant.clone();
+    let state = Arc::clone(state);
+    let holder = holder.clone();
+    tokio::spawn(async move {
+        let event = match crate::floor_wire::floor_grant_event(
+            &state.relay_keypair,
+            channel_id,
+            &holder,
+            revision,
+            ttl,
+        ) {
+            Ok(event) => event,
+            Err(e) => {
+                warn!(channel_id = %channel_id, "floor grant sign failed: {e}");
+                return;
+            }
+        };
+
+        // Redis before local fan-out so subscribers on other relay pods
+        // receive it too, matching emit_live_thread_summary.
+        state.mark_local_event(tenant.community(), &event.id);
+        if let Err(e) = state
+            .pubsub
+            .publish_event(&tenant, EventTopic::Channel(channel_id), &event)
+            .await
+        {
+            state
+                .local_event_ids
+                .invalidate(&(tenant.community(), event.id.to_bytes()));
+            warn!(channel_id = %channel_id, "floor grant Redis publish failed: {e}");
         }
         let stored = StoredEvent::new(event, Some(channel_id));
         crate::handlers::event::fan_out_event_to_local_subscribers(

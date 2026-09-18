@@ -22,6 +22,8 @@ pub mod connection;
 pub mod error;
 /// Pure floor-lease state machine serializing agent replies in group chat.
 pub mod floor;
+/// Signed-event construction for the floor request/grant wire protocol.
+pub mod floor_wire;
 /// WebSocket message handlers for NIP-01 client commands.
 pub mod handlers;
 /// Stateless HMAC-signed relay invite tokens (mint/verify).

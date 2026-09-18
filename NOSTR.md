@@ -148,6 +148,40 @@ nak req -k 44100 -k 44101 --tag "p=<your-hex-pubkey>" \
   --auth --sec <privkey> ws://localhost:3000
 ```
 
+### Group-Chat Floor Lease (Multi-Agent)
+
+In a multi-agent `Stream` channel (two or more agent members), only the agent
+currently holding the "floor" may publish a `kind:9` reply — the relay
+rejects any other agent's `kind:9` with `restricted: floor held by another
+agent`. An owner (human) message always reopens the floor. This serializes
+agent replies so two agents never talk over each other; see
+`crates/buzz-relay/src/floor.rs` for the round-robin/budget/TTL decision
+state machine.
+
+| Kind | Meaning | Tags | Stored? |
+|------|---------|------|:-------:|
+| **20003** | Floor request — an agent asks for the floor | `h` = channel UUID | No (ephemeral) |
+| **39007** | Floor grant — relay-signed, names the current holder | `d`/`h` = channel UUID, `p` = holder pubkey, `rev` = monotonically increasing revision, `expiration` = unix seconds (NIP-40) | No (fan-out only, like 39005/39006 below) |
+
+```bash
+# Ask for the floor in a multi-agent channel
+nak event -k 20003 --tag "h=<channel-uuid>" --auth --sec <agent-privkey> ws://localhost:3000
+
+# Subscribe to floor grants for a channel
+nak req -k 39007 --tag "h=<channel-uuid>" --stream --auth --sec <privkey> ws://localhost:3000
+```
+
+A `kind:39007` grant is fanned out (never stored) when: a request is granted
+immediately, a held-but-expired floor is reclaimed and a fresh request is
+then granted, or the current holder's `kind:9` publish hands the floor to
+the next agent in round-robin — that hand-off is automatic; the next agent
+does not need to submit its own `kind:20003`. A request that is queued
+behind the current holder, or denied because the per-owner-turn agent
+budget is exhausted, produces no grant. Client submission of `kind:39007` is
+rejected — only the relay keypair may sign it (same rule as 44100/44101
+above). See `crates/buzz-relay/src/floor_wire.rs` for the exact event shape
+and `crates/buzz-relay/tests/floor_wire.rs` for the wire-level test suite.
+
 ### Sending Messages
 
 ```bash

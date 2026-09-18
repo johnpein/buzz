@@ -438,6 +438,21 @@ pub const KIND_THREAD_SUMMARY: u32 = 39005;
 /// clients must not infer `has_more` from row counts.
 pub const KIND_WINDOW_BOUNDS: u32 = 39006;
 
+/// Group-chat floor-lease grant (relay-signed, addressable, d=channel_id).
+///
+/// Names the channel's current `FloorLease` holder + expiry for the
+/// multi-agent floor request/grant wire protocol (see
+/// `crates/buzz-relay/src/floor.rs` for the decision state machine and
+/// `crates/buzz-relay/src/floor_wire.rs` for the signed-event shape).
+/// Fan-out only — never stored — the same "39xxx but never persisted"
+/// convention as [`KIND_THREAD_SUMMARY`] / [`KIND_WINDOW_BOUNDS`] above:
+/// clients get the current holder from the live overlay, not from history.
+/// Tags: `p` = holder pubkey, `h` = channel id (same value as `d`), `rev` =
+/// monotonically increasing revision, `expiration` = unix seconds (NIP-40
+/// convention). Relay-only: client submission is rejected (see
+/// [`is_relay_only_kind`]). See `NOSTR.md`.
+pub const KIND_FLOOR_GRANT: u32 = 39007;
+
 /// Workflow definition (parameterized replaceable, d=workflow_uuid).
 pub const KIND_WORKFLOW_DEF: u32 = 30620;
 
@@ -470,6 +485,15 @@ pub const KIND_AGENT_OBSERVER_FRAME: u32 = 24200;
 /// Ephemeral: huddle emoji reaction burst. Channel-scoped to the ephemeral
 /// huddle channel with an `h` tag; never stored in the timeline.
 pub const KIND_HUDDLE_REACTION: u32 = 24810;
+/// Ephemeral: an agent requests the group-chat floor in a multi-agent
+/// `ChannelType::Stream` channel (see `crates/buzz-relay/src/floor.rs`).
+/// Channel-scoped via an `h` tag, same convention as
+/// [`KIND_TYPING_INDICATOR`]. Never stored; given dedicated handling in
+/// `buzz_relay::handlers::event::handle_ephemeral_event` (rather than plain
+/// ephemeral passthrough) that consults the channel's `FloorLease` and, on a
+/// fresh grant, triggers a relay-signed [`KIND_FLOOR_GRANT`] fan-out. See
+/// `NOSTR.md` for the wire protocol.
+pub const KIND_FLOOR_REQUEST: u32 = 20003;
 // Stream messaging
 /// NIP-29 group chat message kind. V1 used kind:10001 (replaceable range — wrong), then 40001.
 ///
@@ -695,6 +719,8 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_PRESENCE_UPDATE,
     KIND_TYPING_INDICATOR,
     KIND_HUDDLE_REACTION,
+    KIND_FLOOR_REQUEST,
+    KIND_FLOOR_GRANT,
     KIND_BLOSSOM_AUTH,
     KIND_PAIRING,
     KIND_AGENT_OBSERVER_FRAME,
@@ -836,6 +862,7 @@ pub const fn is_relay_only_kind(kind: u32) -> bool {
             | KIND_DM_VISIBILITY
             | KIND_THREAD_SUMMARY
             | KIND_WINDOW_BOUNDS
+            | KIND_FLOOR_GRANT
     )
 }
 
@@ -864,6 +891,9 @@ const _: () = assert!(is_parameterized_replaceable(KIND_DM_VISIBILITY)); // 3062
 const _: () = assert!(is_parameterized_replaceable(KIND_PROJECT)); // 30621 ∈ 30000–39999
 const _: () = assert!(is_parameterized_replaceable(KIND_THREAD_SUMMARY)); // 39005 ∈ 30000–39999
 const _: () = assert!(is_parameterized_replaceable(KIND_WINDOW_BOUNDS)); // 39006 ∈ 30000–39999
+const _: () = assert!(is_parameterized_replaceable(KIND_FLOOR_GRANT)); // 39007 ∈ 30000–39999
+const _: () = assert!(is_ephemeral(KIND_FLOOR_REQUEST)); // 20003 ∈ 20000–29999
+const _: () = assert!(is_relay_only_kind(KIND_FLOOR_GRANT));
 
 // Compile-time: NIP-34 parameterized replaceable kinds are in the correct range.
 const _: () = assert!(

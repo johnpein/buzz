@@ -160,6 +160,7 @@ pub struct FloorLease {
     holder: Option<PubkeyHex>,
     granted_at: Option<Instant>,
     agent_turns: u32,
+    revision: u64,
 }
 
 impl FloorLease {
@@ -175,6 +176,7 @@ impl FloorLease {
             holder: None,
             granted_at: None,
             agent_turns: 0,
+            revision: 0,
         }
     }
 
@@ -192,6 +194,13 @@ impl FloorLease {
     /// holder), grants immediately when the floor is free, re-grants an
     /// idempotent re-request from the current holder, and otherwise queues
     /// behind the current holder.
+    ///
+    /// Every *fresh* grant (the floor was free and is now held) bumps
+    /// [`Self::revision`] — the counter the wire protocol's `kind:39007`
+    /// grant event carries so subscribers can tell one grant apart from the
+    /// next even if delivery reorders them. An idempotent re-request from
+    /// the already-current holder returns `Granted` again without bumping
+    /// the revision, since no new grant occurred.
     pub fn request(&mut self, agent: &PubkeyHex, now: Instant) -> FloorDecision {
         if self.agent_turns >= self.budget {
             return FloorDecision::DeniedBudgetExhausted;
@@ -202,9 +211,19 @@ impl FloorLease {
             None => {
                 self.holder = Some(agent.clone());
                 self.granted_at = Some(now);
+                self.revision += 1;
                 FloorDecision::Granted
             }
         }
+    }
+
+    /// The number of fresh grants this lease has ever issued (see
+    /// [`Self::request`]). Starts at 0 (no grant yet) and only ever
+    /// increases, so it is safe to carry on the wire as a strictly
+    /// increasing `rev` tag.
+    #[must_use]
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// Record a publish by the current holder: validates holdership,
@@ -487,6 +506,65 @@ mod tests {
     fn unknown_and_garbage_channel_types_are_not_enforced() {
         assert!(!is_enforced_channel_type("not-a-real-channel-type"));
         assert!(!is_enforced_channel_type(""));
+    }
+
+    // --- revision: Task 4 wire-protocol precondition ---------------------
+    //
+    // The relay's kind:39007 grant event carries `FloorLease::revision()` as
+    // its `rev` tag so a subscriber can order grants even under redelivery.
+    // These are the pure decision-level tests for that counter; the actual
+    // signed-event shape is covered in `crates/buzz-relay/src/floor_wire.rs`
+    // and the wire-level fan-out assertions live in
+    // `crates/buzz-relay/tests/floor_wire.rs` (see that file's header for why
+    // they replace the `buzz-conformance` crate named in the task brief).
+
+    #[test]
+    fn revision_starts_at_zero_and_bumps_on_first_grant() {
+        let mut f = FloorLease::new(vec![gabe(), stacy()], Duration::from_secs(30), 8);
+        assert_eq!(f.revision(), 0);
+        assert!(matches!(f.request(&gabe(), t0()), FloorDecision::Granted));
+        assert_eq!(f.revision(), 1);
+    }
+
+    #[test]
+    fn revision_does_not_bump_on_idempotent_re_request() {
+        let mut f = FloorLease::new(vec![gabe(), stacy()], Duration::from_secs(30), 8);
+        f.request(&gabe(), t0());
+        assert_eq!(f.revision(), 1);
+        // Same holder asking again is idempotent — still Granted, no new revision.
+        assert!(matches!(f.request(&gabe(), t0()), FloorDecision::Granted));
+        assert_eq!(f.revision(), 1);
+    }
+
+    #[test]
+    fn revision_does_not_bump_while_queued_or_budget_denied() {
+        let mut f = FloorLease::new(vec![gabe(), stacy()], Duration::from_secs(30), 1);
+        f.request(&gabe(), t0());
+        assert_eq!(f.revision(), 1);
+        // stacy is queued behind gabe — no grant, no revision bump.
+        assert!(matches!(f.request(&stacy(), t0()), FloorDecision::Queued));
+        assert_eq!(f.revision(), 1);
+        f.on_publish(&gabe(), t0()).unwrap(); // exhausts the budget of 1
+        assert!(matches!(
+            f.request(&stacy(), t0()),
+            FloorDecision::DeniedBudgetExhausted
+        ));
+        assert_eq!(f.revision(), 1);
+    }
+
+    #[test]
+    fn revision_strictly_increases_across_round_robin_grants() {
+        // Models the wire flow: gabe is granted (rev 1), publishes, the
+        // relay auto-requests the round-robin next agent (stacy) on his
+        // behalf (rev 2) — see `handlers::ingest::enforce_floor_lease`.
+        let mut f = FloorLease::new(vec![gabe(), stacy()], Duration::from_secs(30), 8);
+        assert_eq!(f.request(&gabe(), t0()), FloorDecision::Granted);
+        let rev1 = f.revision();
+        let next = f.on_publish(&gabe(), t0()).unwrap();
+        assert_eq!(next, NextGrant::Some(stacy()));
+        assert_eq!(f.request(&stacy(), t0()), FloorDecision::Granted);
+        let rev2 = f.revision();
+        assert!(rev2 > rev1, "revision must strictly increase: {rev1} -> {rev2}");
     }
 
     // --- classify_member: proves the fail-closed mapping directly. ---

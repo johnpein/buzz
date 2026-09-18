@@ -8,7 +8,7 @@ use tracing::{debug, error, info, warn};
 use buzz_core::event::StoredEvent;
 use buzz_core::kind::{
     event_kind_u32, is_ephemeral, is_unshared_gated_event, AUTHOR_ONLY_KINDS,
-    KIND_AGENT_OBSERVER_FRAME, KIND_GIFT_WRAP, KIND_PRESENCE_UPDATE,
+    KIND_AGENT_OBSERVER_FRAME, KIND_FLOOR_REQUEST, KIND_GIFT_WRAP, KIND_PRESENCE_UPDATE,
 };
 use buzz_core::observer::{
     content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
@@ -810,6 +810,22 @@ async fn handle_ephemeral_event(
         Ok(Ok(())) => {}
         Ok(Err(e)) => return Err(format!("invalid: {e}")),
         Err(_) => return Err("error: internal error".to_string()),
+    }
+
+    // Special handling for floor-request events (kind:20003): drive the
+    // group-chat FloorLease request/grant decision (Task 4 of the
+    // multi-agent floor-lease work) instead of plain ephemeral passthrough.
+    // A malformed request (no `h` tag) is silently ignored here — the
+    // generic fall-through below still fans it out as an ordinary
+    // channel-less ephemeral event, matching every other ephemeral kind's
+    // behavior on a missing scope tag.
+    if event_kind_u32(&event) == KIND_FLOOR_REQUEST {
+        if let Some(ch_id) = super::ingest::extract_channel_id(&event) {
+            super::ingest::handle_floor_request(&state, &conn.tenant, ch_id, &auth_pubkey).await?;
+        }
+        // Falls through to the shared channel-scoped ephemeral publish/fan-out
+        // path below so other channel subscribers also observe the raw
+        // request event, same as every other ephemeral kind.
     }
 
     // Special handling for presence events (kind:20001).
