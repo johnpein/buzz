@@ -494,6 +494,33 @@ impl RestClient {
             .map_err(|e| RelayError::Http(e.to_string()))
     }
 
+    /// Fetch the relay's own NIP-29 group-state signing key.
+    ///
+    /// `GET /info` (unauthenticated, public NIP-11 relay information document)
+    /// returns the `self` field: the relay's stable signing pubkey, advertised
+    /// only when the relay has one configured (see buzz-relay's `nip11_facts`,
+    /// whose own doc comment names this exact field as the trust anchor for
+    /// verifying NIP-29 group-state events). A relay running on an ephemeral
+    /// key (no stable identity) has no `self` and this fails closed — there is
+    /// no authority to verify group membership against.
+    pub async fn fetch_relay_self_pubkey(&self) -> Result<String, RelayError> {
+        let url = format!("{}/info", self.base_url);
+        let resp = self
+            .request_with_retry("GET", "/info", || self.http.get(&url).send())
+            .await?;
+        let info: Value = resp
+            .json()
+            .await
+            .map_err(|e| RelayError::Http(e.to_string()))?;
+        info.get("self")
+            .and_then(Value::as_str)
+            .filter(|pubkey| !pubkey.is_empty())
+            .map(|pubkey| pubkey.to_ascii_lowercase())
+            .ok_or_else(|| {
+                RelayError::Http("relay info document has no stable signing key (`self`)".into())
+            })
+    }
+
     /// Submit a signed event via the HTTP bridge: `POST /events` with NIP-98 auth.
     ///
     /// The event must already be signed. Returns the relay response JSON.

@@ -3318,19 +3318,47 @@ fn huddle_instructions_from_query_response(
 }
 
 /// Fetch and verify the current replaceable membership event for one channel.
-/// The authenticated relay query supplies the authoritative snapshot; the
-/// embedded Nostr signature and channel `d` tag are still checked before use.
+///
+/// `kind:39002` is part of the NIP-29 addressable group-state range
+/// (39000-39003), which buzz-relay always signs with its own relay keypair —
+/// never the channel owner's or an admin's key (see
+/// `group_members_tags`/`store_group_members_event` in
+/// `buzz-relay/src/handlers/side_effects.rs`, which call
+/// `sign_with_keys(&state.relay_keypair)`). The relay's stable signing pubkey
+/// is advertised at `GET /info` as the NIP-11 `self` field specifically so
+/// clients can verify NIP-29 group state (see buzz-relay's `nip11_facts` doc
+/// comment). Because Task 5 made `members` authorization-critical (it now
+/// drives kind:9 author admission for stream channels — see
+/// `build_verified_buzz_prompt_params` in `buzz_envelope.rs`), this lookup
+/// restricts the relay filter to that authoritative pubkey AND re-checks the
+/// parsed event's signer against it, failing closed (returning an error, not
+/// an empty/absent result) if the relay has no stable identity or the
+/// snapshot's signer does not match it. Without this, an attacker could
+/// publish a self-signed competing `kind:39002` (self-consistent signature,
+/// but from an unauthorized key) to inject their own pubkey into the roster.
 async fn fetch_verified_channel_members(
     channel_id: Uuid,
     rest: &RestClient,
 ) -> Result<Vec<(String, String)>, AcpError> {
     use nostr::{Alphabet, SingleLetterTag};
 
+    let relay_self_hex = timeout(CONTEXT_FETCH_TIMEOUT, rest.fetch_relay_self_pubkey())
+        .await
+        .map_err(|_| AcpError::Protocol("Buzz relay identity lookup timed out".into()))?
+        .map_err(|_| {
+            AcpError::Protocol(
+                "Buzz relay has no stable signing identity to trust for group membership".into(),
+            )
+        })?;
+    let relay_self = nostr::PublicKey::from_hex(&relay_self_hex)
+        .map_err(|_| AcpError::Protocol("Buzz relay signing identity is malformed".into()))?;
+
     let d_tag = SingleLetterTag::lowercase(Alphabet::D);
     let filter = nostr::Filter::new()
         .kind(nostr::Kind::Custom(
             buzz_core::kind::KIND_NIP29_GROUP_MEMBERS as u16,
         ))
+        .author(relay_self)
         .custom_tags(d_tag, [channel_id.to_string()]);
     let response = timeout(CONTEXT_FETCH_TIMEOUT, rest.query(&[filter]))
         .await
@@ -3341,11 +3369,37 @@ async fn fetch_verified_channel_members(
         .and_then(|events| events.first())
         .cloned()
         .ok_or_else(|| AcpError::Protocol("Buzz membership snapshot is absent".into()))?;
-    let event: nostr::Event = serde_json::from_value(event_value)
+    verify_channel_members_event(&event_value, channel_id, &relay_self)
+}
+
+/// Parse and verify one already-fetched `kind:39002` candidate event.
+///
+/// Factored out of [`fetch_verified_channel_members`] so the authority check,
+/// channel match, and member extraction are unit-testable without a live
+/// relay connection (mirrors [`huddle_instructions_from_query_response`]
+/// above). `relay_self` is the relay's authoritative NIP-29 group-state
+/// signing key, already resolved by the caller — see the authority doc
+/// comment on [`fetch_verified_channel_members`] for why that key, and not an
+/// unauthenticated snapshot, is required.
+fn verify_channel_members_event(
+    event_value: &serde_json::Value,
+    channel_id: Uuid,
+    relay_self: &nostr::PublicKey,
+) -> Result<Vec<(String, String)>, AcpError> {
+    let event: nostr::Event = serde_json::from_value(event_value.clone())
         .map_err(|_| AcpError::Protocol("Buzz membership snapshot is malformed".into()))?;
     event
         .verify()
         .map_err(|_| AcpError::Protocol("Buzz membership signature is invalid".into()))?;
+    // Defense in depth: the relay filter in `fetch_verified_channel_members`
+    // already restricts `author` to `relay_self`, but re-assert it against
+    // the parsed event so a relay-query regression (or a future edit that
+    // loosens the filter) cannot silently reopen the hole this fix closes.
+    if event.pubkey != *relay_self {
+        return Err(AcpError::Protocol(
+            "Buzz membership snapshot is not signed by the relay's authoritative key".into(),
+        ));
+    }
 
     let channel_text = channel_id.to_string();
     let has_channel = event.tags.iter().any(|tag| {
@@ -8662,6 +8716,47 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             &owner.public_key(),
         )
         .is_none());
+    }
+
+    // ── channel membership authority (Task 5 Fix 1) ────────────────────────
+
+    #[test]
+    fn channel_members_event_requires_relay_authority_signature() {
+        let relay = Keys::generate();
+        let attacker = Keys::generate();
+        let channel = Uuid::parse_str("00f1ccaf-1506-4dd7-9a0e-fa67e9e486ae").unwrap();
+        let member = Keys::generate();
+        let event = |keys: &Keys| {
+            let d_tag = Tag::parse(["d", &channel.to_string()]).unwrap();
+            let p_tag = Tag::parse(["p", &member.public_key().to_hex(), "", "member"]).unwrap();
+            serde_json::to_value(
+                EventBuilder::new(
+                    Kind::Custom(buzz_core::kind::KIND_NIP29_GROUP_MEMBERS as u16),
+                    "",
+                )
+                .tags([d_tag, p_tag])
+                .sign_with_keys(keys)
+                .unwrap(),
+            )
+            .unwrap()
+        };
+
+        // Legitimate: the roster event is signed by the relay's own
+        // authoritative NIP-29 group-state key (its NIP-11 `self`).
+        let members = verify_channel_members_event(&event(&relay), channel, &relay.public_key())
+            .expect("relay-signed roster must be accepted");
+        assert_eq!(
+            members,
+            vec![(member.public_key().to_hex(), "member".to_string())]
+        );
+
+        // Attack: a self-consistent signature from a non-authority key must
+        // not be trusted as the group's membership roster, even though
+        // `event.verify()` alone would pass it.
+        assert!(
+            verify_channel_members_event(&event(&attacker), channel, &relay.public_key()).is_err(),
+            "a roster event signed by a non-authority key must be rejected"
+        );
     }
 
     // ── render_canvas_section ────────────────────────────────────────────────

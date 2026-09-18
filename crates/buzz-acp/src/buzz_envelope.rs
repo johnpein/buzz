@@ -17,6 +17,13 @@ const ENVELOPE_DOMAIN: &[u8] = b"buzz-acp-envelope-v1\0";
 /// downstream, so it is bounded and control-character-free).
 const JOB_TITLE_MAX_BYTES: usize = 512;
 
+/// Defensive upper bound on a stream channel's roster size. The full roster
+/// is embedded in the attested/signed envelope (`channel.members`), so an
+/// unbounded roster would let a compromised or misconfigured membership
+/// source amplify the size of every signed payload. `dm` stays exactly 2
+/// members and is unaffected by this cap.
+const MAX_STREAM_ROSTER_MEMBERS: usize = 50;
+
 /// Verified inputs used to build one authenticated Buzz ACP prompt envelope.
 pub struct VerifiedBuzzPromptInput<'a> {
     /// ACP session receiving the prompt.
@@ -109,6 +116,12 @@ pub fn build_verified_buzz_prompt_params(input: VerifiedBuzzPromptInput<'_>) -> 
                 "Buzz P0 stream channel requires the owner and the acting agent present in the roster"
             );
         }
+        if members.len() > MAX_STREAM_ROSTER_MEMBERS {
+            bail!(
+                "Buzz P0 stream channel roster of {} members exceeds the {MAX_STREAM_ROSTER_MEMBERS}-member cap",
+                members.len()
+            );
+        }
     }
 
     let channel_id = uuid::Uuid::parse_str(channel_id)
@@ -129,10 +142,21 @@ pub fn build_verified_buzz_prompt_params(input: VerifiedBuzzPromptInput<'_>) -> 
         let kind = event.kind.as_u16() as u32;
         if kind == 9 {
             let author = event.pubkey.to_hex().to_ascii_lowercase();
-            // DM: owner-authored only (unchanged). Stream: the owner, or any
-            // roster member already role-validated above — this is how a
-            // sibling agent (e.g. Stacy) is admitted as an author alongside
-            // the acting agent, without widening the DM trust boundary.
+            // DM: owner-authored only (unchanged). Stream: the owner, OR any
+            // role-validated roster member — this is how a sibling agent
+            // (e.g. Stacy) is admitted as an author alongside the acting
+            // agent, without widening the DM trust boundary.
+            //
+            // This is intentionally NOT owner-only like DM: it is the
+            // group-chat semantic (the owner controls who is in the room,
+            // and everyone the owner put in the room may speak in it) — a
+            // deliberate product decision, not a shortcut. It is safe
+            // because `members` is no longer a bare unauthenticated
+            // snapshot: the harness's `fetch_verified_channel_members`
+            // (pool.rs) now verifies the roster event is signed by the
+            // relay's own authoritative NIP-29 group-state key before it
+            // ever reaches this function, so every entry here is an
+            // owner-approved participant, not an attacker-injected one.
             let author_is_admitted = author == owner_pubkey
                 || (channel_type == "stream"
                     && members.iter().any(|member| member["pubkey"] == author));

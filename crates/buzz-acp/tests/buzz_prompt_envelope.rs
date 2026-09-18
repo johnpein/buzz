@@ -1166,6 +1166,55 @@ fn stream_roster_missing_acting_agent_is_rejected() {
 }
 
 #[test]
+fn stream_roster_missing_owner_is_rejected() {
+    // Fix 3: a roster containing the acting agent and a sibling agent but NOT
+    // the owner (e.g. {gabe, stacy} only) must be rejected — the owner's
+    // presence in the roster is required regardless of who else is present.
+    let fixture = StreamFixture::new();
+    let chat = fixture.sign_event_with(&fixture.agent.clone(), 9, "hi");
+    let owner_pubkey = fixture.owner.public_key().to_hex();
+    let members_without_owner: Vec<(String, String)> = fixture
+        .members
+        .iter()
+        .filter(|(pubkey, _)| pubkey != &owner_pubkey)
+        .cloned()
+        .collect();
+    assert_eq!(
+        members_without_owner.len(),
+        2,
+        "sanity: only the owner should have been filtered out"
+    );
+    assert!(
+        fixture
+            .build_with_members(std::slice::from_ref(&chat), &members_without_owner)
+            .is_err(),
+        "a stream roster missing the owner must be rejected even when the acting agent and a sibling are present",
+    );
+}
+
+#[test]
+fn stream_roster_over_cap_is_rejected() {
+    // Fix 2: an oversized stream roster must be rejected before it can be
+    // embedded in (and amplify) the attested/signed envelope payload.
+    let fixture = StreamFixture::new();
+    let chat = fixture.sign_event_with(&fixture.owner.clone(), 9, "hi");
+    let mut members: Vec<(String, String)> = fixture.members.to_vec();
+    while members.len() <= 50 {
+        members.push((Keys::generate().public_key().to_hex(), "member".to_string()));
+    }
+    assert!(
+        members.len() > 50,
+        "sanity: roster must exceed the 50-member cap"
+    );
+    assert!(
+        fixture
+            .build_with_members(std::slice::from_ref(&chat), &members)
+            .is_err(),
+        "a stream roster over the 50-member cap must be rejected",
+    );
+}
+
+#[test]
 fn stream_channel_framing_uses_full_roster_not_two_party_shorthand() {
     let fixture = StreamFixture::new();
     let chat = fixture.sign_event_with(&fixture.owner.clone(), 9, "hi");
