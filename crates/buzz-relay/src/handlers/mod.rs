@@ -12,6 +12,9 @@ pub mod community_provisioning;
 pub mod count;
 /// EVENT handler — WS dispatcher → ingest pipeline → fan-out.
 pub mod event;
+/// Group-chat floor request/grant (`kind:20003`/`kind:39007`) handler glue,
+/// shared by the `event`/`ingest` dispatch sites.
+pub mod floor_glue;
 /// NIP-IA identity archive request handler (kinds 9035–9036).
 pub mod identity_archive;
 /// imeta tag validation helpers.

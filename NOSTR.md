@@ -161,7 +161,7 @@ state machine.
 | Kind | Meaning | Tags | Stored? |
 |------|---------|------|:-------:|
 | **20003** | Floor request — an agent asks for the floor | `h` = channel UUID | No (ephemeral) |
-| **39007** | Floor grant — relay-signed, names the current holder | `d`/`h` = channel UUID, `p` = holder pubkey, `rev` = monotonically increasing revision, `expiration` = unix seconds (NIP-40) | No (fan-out only, like 39005/39006 below) |
+| **39007** | Floor grant — relay-signed, names the current holder, or clears it | `d`/`h` = channel UUID, `p` = holder pubkey (omitted for the cleared/open variant), `status` = `granted` or `open`, `rev` = monotonically increasing revision, `expiration` = unix seconds (NIP-40) | No (fan-out only, like 39005/39006 below) |
 
 ```bash
 # Ask for the floor in a multi-agent channel
@@ -177,10 +177,22 @@ then granted, or the current holder's `kind:9` publish hands the floor to
 the next agent in round-robin — that hand-off is automatic; the next agent
 does not need to submit its own `kind:20003`. A request that is queued
 behind the current holder, or denied because the per-owner-turn agent
-budget is exhausted, produces no grant. Client submission of `kind:39007` is
-rejected — only the relay keypair may sign it (same rule as 44100/44101
-above). See `crates/buzz-relay/src/floor_wire.rs` for the exact event shape
-and `crates/buzz-relay/tests/floor_wire.rs` for the wire-level test suite.
+budget is exhausted, produces no grant.
+
+A `kind:39007` can also carry **no holder** — `status=open` and no `p`
+tag — when a TTL reclaim frees a stalled holder during a `kind:9` publish
+and there is no round-robin next agent to hand the floor to (e.g. a
+non-holder agent's publish triggers the reclaim but is itself rejected).
+Without this variant the floor was internally free but no subscriber was
+ever told, leaving it stuck until some agent happened to post a fresh
+`kind:20003`. Since `kind:39007` is addressable/replaceable per channel,
+the cleared event's `rev` is always strictly greater than the grant it
+supersedes (`FloorLease::reclaim_if_expired` bumps the revision on this
+transition too, not only on a fresh grant), so a subscriber can always tell
+it is newer. Client submission of `kind:39007` is rejected — only the relay
+keypair may sign it (same rule as 44100/44101 above). See
+`crates/buzz-relay/src/floor_wire.rs` for the exact event shape and
+`crates/buzz-relay/tests/floor_wire.rs` for the wire-level test suite.
 
 ### Sending Messages
 

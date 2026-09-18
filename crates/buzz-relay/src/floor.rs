@@ -269,13 +269,26 @@ impl FloorLease {
     /// If the held floor has outlived its TTL as of `now`, reclaim it and
     /// return the stalled holder's key. Does not auto-grant the next
     /// agent — callers re-[`request`](Self::request) to do that.
+    ///
+    /// A real reclaim (the held-and-expired case) is itself a Some→None
+    /// transition of [`Self::current_holder`], so it bumps [`Self::revision`]
+    /// exactly like a fresh grant does — a wire consumer that only sees
+    /// `rev` needs the counter to move on *every* holder change, not only on
+    /// `None`→`Some`, so a subsequent "floor cleared" `kind:39007` (see
+    /// `crate::floor_wire::floor_grant_event`) is provably newer than the
+    /// grant it supersedes. Returning early (nothing held, or held but not
+    /// yet expired) never touches the revision.
     pub fn reclaim_if_expired(&mut self, now: Instant) -> Option<PubkeyHex> {
         let granted_at = self.granted_at?;
         if now.duration_since(granted_at) < self.ttl {
             return None;
         }
         self.granted_at = None;
-        self.holder.take()
+        let holder = self.holder.take();
+        if holder.is_some() {
+            self.revision += 1;
+        }
+        holder
     }
 
     /// The agent currently holding the floor, if any.
@@ -359,6 +372,95 @@ pub fn evaluate_floor_at_ingest(
         Ok(next) => IngestFloorAction::Published(next),
         Err(error) => IngestFloorAction::Rejected(error),
     }
+}
+
+/// Whether `requester` is one of the channel's classified agent members —
+/// the floor protocol's participant gate for a `kind:20003` request.
+/// Non-participants (the human owner, or a pubkey that left the roster) are
+/// ignored rather than rejected, since the request is ephemeral/best-effort
+/// (see `handlers::floor_glue::handle_floor_request`).
+#[must_use]
+pub fn is_floor_participant(agent_pubkeys: &[PubkeyHex], requester: &PubkeyHex) -> bool {
+    agent_pubkeys.iter().any(|agent| agent == requester)
+}
+
+/// What the wire glue should fan out as a `kind:39007` grant after deciding
+/// a kind:9 publish, alongside the accept/reject [`IngestFloorAction`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrantBroadcast {
+    /// Broadcast a fresh grant naming `holder` at `revision`.
+    Grant(PubkeyHex, u64),
+    /// Broadcast an explicit "floor cleared" grant at `revision` — a TTL
+    /// reclaim freed a holder during this call and there was no
+    /// round-robin next agent to hand off to.
+    Clear(u64),
+    /// Nothing to broadcast.
+    None,
+}
+
+/// The full ingest-time floor decision for a kind:9 publish: whether to
+/// accept/reject it ([`IngestFloorAction`], via [`evaluate_floor_at_ingest`])
+/// and what `kind:39007` grant, if any, the wire glue
+/// (`handlers::ingest::enforce_floor_lease`) should fan out as a result
+/// ([`GrantBroadcast`]).
+///
+/// Two behaviors beyond the bare accept/reject decision, both Task 4
+/// review fixes:
+/// - a holder's accepted publish that hands the floor to a round-robin next
+///   agent auto-grants that agent on the spot ([`FloorLease::request`],
+///   bumping the lease's revision) so [`GrantBroadcast::Grant`] is ready to
+///   fan out atomically with the publish that produced it (Task 4's
+///   original "publish hands off" behavior);
+/// - a TTL reclaim that actually freed a stalled holder during this call,
+///   with no round-robin hand-off to show for it, produces
+///   [`GrantBroadcast::Clear`] instead of leaving that TTL-freed state
+///   unannounced (review Fix 1). This can only coincide with a `Rejected`
+///   or `Opened` outcome, never `Published(NextGrant::Some(_))`: a reclaim
+///   always leaves the lease's holder empty, so an author's own publish can
+///   only be `Published` here when no reclaim occurred this call — hence
+///   `Grant` and `Clear` never both apply.
+///
+/// Pure and lock-agnostic like the rest of this module: the caller supplies
+/// `lease` already locked and `now`; no I/O happens here. This is the seam
+/// the review asked to make directly unit-testable without Postgres/AppState
+/// (see `crate::floor_wire` and `crates/buzz-relay/tests/floor_wire.rs` for
+/// the wire-shape and fan-out-level coverage built on top of it).
+#[must_use]
+pub fn evaluate_floor_publish(
+    channel_type: ChannelType,
+    members: &[buzz_db::channel_members::MemberRecord],
+    agent_pubkeys: &[PubkeyHex],
+    author: &PubkeyHex,
+    lease: &mut FloorLease,
+    now: Instant,
+) -> (IngestFloorAction, GrantBroadcast) {
+    // Same gate as evaluate_floor_at_ingest, checked here too so a bypassed
+    // channel never touches the lease (matches that function's documented
+    // "the lease is untouched" bypass contract) even though this wrapper
+    // reclaims before delegating.
+    if channel_type != ChannelType::Stream || !is_floor_enforced(members, agent_pubkeys) {
+        return (IngestFloorAction::Bypass, GrantBroadcast::None);
+    }
+
+    let reclaimed = lease.reclaim_if_expired(now);
+
+    // evaluate_floor_at_ingest re-checks the same gate and re-attempts the
+    // reclaim; both are no-ops here (the gate already matched above, and
+    // `reclaim_if_expired` immediately returns `None` once `granted_at` is
+    // already cleared — see its doc comment), so this does not change the
+    // decision it makes.
+    let action = evaluate_floor_at_ingest(channel_type, members, agent_pubkeys, author, lease, now);
+
+    let broadcast = match &action {
+        IngestFloorAction::Published(NextGrant::Some(next)) => {
+            lease.request(next, now);
+            GrantBroadcast::Grant(next.clone(), lease.revision())
+        }
+        _ if reclaimed.is_some() => GrantBroadcast::Clear(lease.revision()),
+        _ => GrantBroadcast::None,
+    };
+
+    (action, broadcast)
 }
 
 #[cfg(test)]
@@ -587,5 +689,183 @@ mod tests {
             classify_member(Err(IndeterminateMember)),
             Err(IndeterminateMember)
         );
+    }
+
+    // --- Task 4 review Fix 1: TTL reclaim is a revision-bumping clear -----
+
+    #[test]
+    fn reclaim_bumps_revision_on_a_real_some_to_none_clear() {
+        let mut f = FloorLease::new(vec![gabe(), stacy()], Duration::from_secs(30), 8);
+        f.request(&gabe(), t0());
+        assert_eq!(f.revision(), 1);
+        assert_eq!(
+            f.reclaim_if_expired(t0() + Duration::from_secs(31)),
+            Some(gabe())
+        );
+        assert_eq!(
+            f.revision(),
+            2,
+            "a real Some->None clear must bump revision same as a fresh grant"
+        );
+    }
+
+    #[test]
+    fn reclaim_does_not_bump_revision_when_nothing_was_held() {
+        let mut f = FloorLease::new(vec![gabe(), stacy()], Duration::from_secs(30), 8);
+        assert_eq!(f.reclaim_if_expired(t0()), None);
+        assert_eq!(f.revision(), 0);
+    }
+
+    #[test]
+    fn reclaim_does_not_bump_revision_when_not_yet_expired() {
+        let mut f = FloorLease::new(vec![gabe(), stacy()], Duration::from_secs(30), 8);
+        f.request(&gabe(), t0());
+        assert_eq!(f.revision(), 1);
+        assert_eq!(f.reclaim_if_expired(t0()), None);
+        assert_eq!(f.revision(), 1);
+    }
+
+    // --- is_floor_participant -----------------------------------------
+
+    #[test]
+    fn is_floor_participant_true_for_a_roster_agent() {
+        assert!(is_floor_participant(&[gabe(), stacy()], &gabe()));
+    }
+
+    #[test]
+    fn is_floor_participant_false_for_a_non_agent() {
+        assert!(!is_floor_participant(&[gabe(), stacy()], &owner()));
+    }
+
+    // --- evaluate_floor_publish: the grant-vs-clear-vs-nothing decision ---
+    //
+    // Task 4 review Fix 2: this is the pure decision the wire glue
+    // (`handlers::ingest::enforce_floor_lease`) drives, made directly
+    // unit-testable here without Postgres/AppState.
+
+    #[test]
+    fn evaluate_floor_publish_bypasses_a_non_enforced_channel_untouched() {
+        let members = roster(&[owner_role(), member_role(gabe())]);
+        let mut f = FloorLease::new(vec![gabe()], Duration::from_secs(30), 8);
+        let (action, broadcast) = evaluate_floor_publish(
+            ChannelType::Dm,
+            &members,
+            &[gabe()],
+            &gabe(),
+            &mut f,
+            t0(),
+        );
+        assert_eq!(action, IngestFloorAction::Bypass);
+        assert_eq!(broadcast, GrantBroadcast::None);
+        assert!(f.current_holder().is_none(), "bypass must not touch the lease");
+    }
+
+    #[test]
+    fn evaluate_floor_publish_grants_the_round_robin_next_agent_on_publish() {
+        let members = roster(&[owner_role(), member_role(gabe()), member_role(stacy())]);
+        let agents = [gabe(), stacy()];
+        let mut f = FloorLease::new(vec![gabe(), stacy()], Duration::from_secs(30), 8);
+        assert_eq!(f.request(&gabe(), t0()), FloorDecision::Granted);
+
+        let (action, broadcast) =
+            evaluate_floor_publish(ChannelType::Stream, &members, &agents, &gabe(), &mut f, t0());
+
+        assert!(matches!(action, IngestFloorAction::Published(_)));
+        match broadcast {
+            GrantBroadcast::Grant(holder, revision) => {
+                assert_eq!(holder, stacy());
+                assert_eq!(revision, f.revision());
+            }
+            other => panic!("expected a Grant broadcast, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn evaluate_floor_publish_clears_on_a_reclaim_with_no_next_grant() {
+        // gabe is granted and stalls (never publishes); stacy — who never
+        // held the floor — then tries to publish kind:9. The TTL reclaim
+        // frees gabe's stalled hold, but stacy's own publish is still
+        // rejected (she never requested it), so there is no NextGrant to
+        // hand off to — this must broadcast Clear, not silently swallow the
+        // freed floor (the review's stuck-floor bug).
+        let members = roster(&[owner_role(), member_role(gabe()), member_role(stacy())]);
+        let agents = [gabe(), stacy()];
+        let mut f = FloorLease::new(vec![gabe(), stacy()], Duration::from_secs(30), 8);
+        assert_eq!(f.request(&gabe(), t0()), FloorDecision::Granted);
+        let rev_before = f.revision();
+
+        let stalled_at = t0() + Duration::from_secs(31);
+        let (action, broadcast) = evaluate_floor_publish(
+            ChannelType::Stream,
+            &members,
+            &agents,
+            &stacy(),
+            &mut f,
+            stalled_at,
+        );
+
+        assert!(
+            matches!(action, IngestFloorAction::Rejected(_)),
+            "stacy never held the floor, so her publish is still rejected"
+        );
+        match broadcast {
+            GrantBroadcast::Clear(revision) => {
+                assert!(
+                    revision > rev_before,
+                    "cleared revision must strictly exceed the prior grant: {rev_before} -> {revision}"
+                );
+                assert_eq!(revision, f.revision());
+            }
+            other => panic!("expected a Clear broadcast, got {other:?}"),
+        }
+        assert!(f.current_holder().is_none());
+    }
+
+    #[test]
+    fn evaluate_floor_publish_emits_nothing_for_an_ordinary_owner_message() {
+        let members = roster(&[owner_role(), member_role(gabe()), member_role(stacy())]);
+        let agents = [gabe(), stacy()];
+        let mut f = FloorLease::new(vec![gabe(), stacy()], Duration::from_secs(30), 8);
+
+        let (action, broadcast) =
+            evaluate_floor_publish(ChannelType::Stream, &members, &agents, &owner(), &mut f, t0());
+
+        assert_eq!(action, IngestFloorAction::Opened);
+        assert_eq!(
+            broadcast,
+            GrantBroadcast::None,
+            "no reclaim happened, so an ordinary owner message broadcasts nothing"
+        );
+    }
+
+    // --- tiny roster-builder fixtures for the tests above -----------------
+    //
+    // Mirrors `crates/buzz-relay/tests/floor_lease.rs`'s own `roster` helper
+    // (real `channel_members` row shape: `pubkey` as compressed key bytes,
+    // `role` as its canonical lowercase string), kept local since that
+    // integration test's helpers are not exported.
+
+    fn owner_role() -> (PubkeyHex, buzz_db::channel_members::MemberRole) {
+        (owner(), buzz_db::channel_members::MemberRole::Owner)
+    }
+
+    fn member_role(agent: PubkeyHex) -> (PubkeyHex, buzz_db::channel_members::MemberRole) {
+        (agent, buzz_db::channel_members::MemberRole::Member)
+    }
+
+    fn roster(
+        entries: &[(PubkeyHex, buzz_db::channel_members::MemberRole)],
+    ) -> Vec<buzz_db::channel_members::MemberRecord> {
+        entries
+            .iter()
+            .map(|(pubkey, role)| buzz_db::channel_members::MemberRecord {
+                channel_id: uuid::Uuid::nil(),
+                pubkey: hex::decode(pubkey.as_str()).expect("test pubkey is valid hex"),
+                role: role.as_str().to_string(),
+                joined_at: chrono::Utc::now(),
+                invited_by: None,
+                removed_at: None,
+            })
+            .collect()
     }
 }

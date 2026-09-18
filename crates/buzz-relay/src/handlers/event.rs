@@ -821,7 +821,7 @@ async fn handle_ephemeral_event(
     // behavior on a missing scope tag.
     if event_kind_u32(&event) == KIND_FLOOR_REQUEST {
         if let Some(ch_id) = super::ingest::extract_channel_id(&event) {
-            super::ingest::handle_floor_request(&state, &conn.tenant, ch_id, &auth_pubkey).await?;
+            super::floor_glue::handle_floor_request(&state, &conn.tenant, ch_id, &auth_pubkey).await?;
         }
         // Falls through to the shared channel-scoped ephemeral publish/fan-out
         // path below so other channel subscribers also observe the raw

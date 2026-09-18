@@ -2173,142 +2173,27 @@ async fn author_type_label(
     }
 }
 
-/// Fail-closed agent-membership lookup for the floor gate
-/// (`enforce_floor_lease`). Unlike [`author_type_label`] (metric-labeling
-/// only, deliberately fail-open: `Ok(None) | Err(_) => false`/"human"), this
-/// feeds a security-relevant authorization decision, so a DB error and an
-/// unknown pubkey both collapse to `Err(IndeterminateMember)` ("cannot
-/// determine") instead of `Ok(false)` ("human"). Bypasses
-/// `author_type_cache`, which is populated under the fail-open policy and
-/// would otherwise re-surface a previously-coerced "human" for an
-/// errored/unknown lookup. See [`crate::floor::classify_member`] for how the
-/// caller turns this into a [`crate::floor::MemberKind`].
-async fn floor_gate_agent_lookup(
-    state: &Arc<AppState>,
-    community: CommunityId,
-    pubkey_bytes: &[u8],
-) -> Result<bool, crate::floor::IndeterminateMember> {
-    match state.db.get_agent_channel_policy(community, pubkey_bytes).await {
-        Ok(Some((_, owner))) => Ok(owner.is_some()),
-        Ok(None) => Err(crate::floor::IndeterminateMember),
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "floor gate agent-membership lookup failed; failing closed"
-            );
-            Err(crate::floor::IndeterminateMember)
-        }
-    }
-}
-
-/// Shared context resolved once for a floor-enforced channel: its roster,
-/// the subset classified as agents, and the channel's cached
-/// [`crate::floor::FloorLease`]. Consumed by both the kind:9 publish gate
-/// ([`enforce_floor_lease`]) and the kind:20003 floor-request handler
-/// ([`handle_floor_request`]) so the roster/agent-classification plumbing
-/// has exactly one implementation.
-pub(crate) struct FloorContext {
-    pub(crate) members: Vec<buzz_db::channel_members::MemberRecord>,
-    pub(crate) agent_pubkeys: Vec<buzz_sdk::broker::PubkeyHex>,
-    pub(crate) lease: Arc<std::sync::Mutex<crate::floor::FloorLease>>,
-}
-
-/// Resolve the floor context for `channel_id`, or `None` if the channel is
-/// not floor-enforced.
-///
-/// Bypass (returns `Ok(None)`) covers exactly the two conditions
-/// [`crate::floor::evaluate_floor_at_ingest`] itself bypasses on: a
-/// non-`Stream` channel type, or a roster with fewer than two agent members
-/// ([`crate::floor::is_floor_enforced`]) — so DMs and single-agent streams
-/// never even reach the lease cache. Agent classification is fail-closed:
-/// an indeterminate lookup (DB error or unknown pubkey) for any member
-/// aborts with [`IngestError::Internal`] rather than silently treating that
-/// member as human (see [`floor_gate_agent_lookup`] and
-/// [`crate::floor::classify_member`]).
-pub(crate) async fn resolve_floor_lease(
-    state: &Arc<AppState>,
-    tenant: &TenantContext,
-    channel_id: Uuid,
-    channel_row: Option<&buzz_db::channel::ChannelRecord>,
-) -> Result<Option<FloorContext>, IngestError> {
-    use buzz_sdk::broker::PubkeyHex;
-
-    // Authoritative enforcement gate (design requirement 1): only stream
-    // channels are floor-enforced. DMs/forums bypass before any roster load.
-    let is_stream = channel_row
-        .map(|row| crate::floor::is_enforced_channel_type(&row.channel_type))
-        .unwrap_or(false);
-    if !is_stream {
-        return Ok(None);
-    }
-
-    let members = state
-        .db
-        .get_members(tenant.community(), channel_id)
-        .await
-        .map_err(|e| IngestError::Internal(format!("error: floor roster load: {e}")))?;
-
-    // Resolve which roster members are agents. Fail-closed: an indeterminate
-    // classification for any member aborts via IngestError rather than
-    // silently treating that member as human (see floor_gate_agent_lookup
-    // and crate::floor::classify_member).
-    let mut agent_pubkeys = Vec::new();
-    for member in &members {
-        let lookup = floor_gate_agent_lookup(state, tenant.community(), &member.pubkey).await;
-        match crate::floor::classify_member(lookup) {
-            Ok(crate::floor::MemberKind::Agent) => {
-                if let Ok(hex) = PubkeyHex::parse(hex::encode(&member.pubkey)) {
-                    agent_pubkeys.push(hex);
-                }
-            }
-            Ok(crate::floor::MemberKind::Human) => {}
-            Err(crate::floor::IndeterminateMember) => {
-                return Err(IngestError::Internal(format!(
-                    "error: floor agent classification indeterminate for a member of channel {channel_id}"
-                )));
-            }
-        }
-    }
-
-    if !crate::floor::is_floor_enforced(&members, &agent_pubkeys) {
-        return Ok(None);
-    }
-
-    // Get-or-create this channel's lease over the current agent set. On an
-    // existing entry the init closure is not run, so a lease created earlier is
-    // reused (its rotation may lag a since-changed roster — see report concern).
-    let lease = state
-        .floor_leases
-        .get_with((tenant.community(), channel_id), || {
-            Arc::new(std::sync::Mutex::new(crate::floor::FloorLease::new(
-                agent_pubkeys.clone(),
-                crate::floor::DEFAULT_FLOOR_TTL,
-                crate::floor::DEFAULT_FLOOR_BUDGET,
-            )))
-        });
-
-    Ok(Some(FloorContext {
-        members,
-        agent_pubkeys,
-        lease,
-    }))
-}
-
 /// Enforce the group-chat floor lease for a kind:9 (stream message) publish.
 ///
-/// Thin I/O wiring over the pure [`crate::floor::evaluate_floor_at_ingest`]
-/// decision (`crates/buzz-relay/src/floor.rs`), fed by [`resolve_floor_lease`].
-/// Non-stream/non-enforced channels return early untouched. A publish by an
-/// agent that does not hold the floor is rejected through the same
-/// [`IngestError::Rejected`] surface the membership-revision CAS check uses,
-/// so buzz-acp's existing publish-rejection back-off/requeue handles it.
+/// Thin I/O wiring over the pure [`crate::floor::evaluate_floor_publish`]
+/// decision (`crates/buzz-relay/src/floor.rs`), fed by
+/// [`crate::handlers::floor_glue::resolve_floor_lease`]. Non-stream/non-enforced
+/// channels return early untouched. A publish by an agent that does not
+/// hold the floor is rejected through the same [`IngestError::Rejected`]
+/// surface the membership-revision CAS check uses, so buzz-acp's existing
+/// publish-rejection back-off/requeue handles it. Stays inline here (rather
+/// than moving into `handlers::floor_glue` with the rest of the floor glue)
+/// because it shares this ingest CAS seam with that membership-revision
+/// check — see the Task 4 review report.
 ///
-/// On the holder's accepted publish, if round-robin names a next agent
-/// ([`crate::floor::NextGrant::Some`]), that agent is auto-granted on the
-/// spot (`FloorLease::request`, bumping the lease's revision) and a
-/// `kind:39007` grant is fanned out — Task 4's "publish hands the floor to
-/// the next agent" wire behavior. Queued/budget-exhausted/opened outcomes
-/// emit no grant.
+/// `evaluate_floor_publish` folds in two `kind:39007` fan-out decisions:
+/// on the holder's accepted publish, if round-robin names a next agent, that
+/// agent is auto-granted on the spot and the grant is fanned out — Task 4's
+/// "publish hands the floor to the next agent" wire behavior. And when a
+/// TTL reclaim frees a stalled holder during this call with no round-robin
+/// hand-off to show for it, an explicit "floor cleared" grant is fanned out
+/// instead of leaving that TTL-freed state unannounced (review Fix 1).
+/// Queued/budget-exhausted/opened outcomes with no reclaim emit no grant.
 async fn enforce_floor_lease(
     state: &Arc<AppState>,
     tenant: &TenantContext,
@@ -2319,7 +2204,10 @@ async fn enforce_floor_lease(
     use buzz_db::channel::ChannelType;
     use buzz_sdk::broker::PubkeyHex;
 
-    let Some(ctx) = resolve_floor_lease(state, tenant, channel_id, channel_row).await? else {
+    let Some(ctx) =
+        crate::handlers::floor_glue::resolve_floor_lease(state, tenant, channel_id, channel_row)
+            .await?
+    else {
         return Ok(());
     };
 
@@ -2335,41 +2223,41 @@ async fn enforce_floor_lease(
         return Ok(());
     };
 
-    let (action, next_grant) = {
+    let (action, broadcast) = {
         // Synchronous decision; this guard never spans an `.await`.
         let mut guard = ctx.lease.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let action = crate::floor::evaluate_floor_at_ingest(
+        crate::floor::evaluate_floor_publish(
             ChannelType::Stream,
             &ctx.members,
             &ctx.agent_pubkeys,
             &author_hex,
             &mut guard,
             std::time::Instant::now(),
-        );
-        // On an accepted publish that names a round-robin next agent,
-        // auto-grant it now (still under the same lock) so the grant is
-        // computed atomically with the publish that produced it.
-        let next_grant = if let crate::floor::IngestFloorAction::Published(
-            crate::floor::NextGrant::Some(next),
-        ) = &action
-        {
-            guard.request(next, std::time::Instant::now());
-            Some((next.clone(), guard.revision()))
-        } else {
-            None
-        };
-        (action, next_grant)
+        )
     };
 
-    if let Some((holder, revision)) = next_grant {
-        crate::handlers::side_effects::emit_floor_grant(
-            tenant,
-            state,
-            channel_id,
-            &holder,
-            revision,
-            crate::floor::DEFAULT_FLOOR_TTL,
-        );
+    match &broadcast {
+        crate::floor::GrantBroadcast::Grant(holder, revision) => {
+            crate::handlers::floor_glue::emit_floor_grant(
+                tenant,
+                state,
+                channel_id,
+                Some(holder),
+                *revision,
+                crate::floor::DEFAULT_FLOOR_TTL,
+            );
+        }
+        crate::floor::GrantBroadcast::Clear(revision) => {
+            crate::handlers::floor_glue::emit_floor_grant(
+                tenant,
+                state,
+                channel_id,
+                None,
+                *revision,
+                crate::floor::DEFAULT_FLOOR_TTL,
+            );
+        }
+        crate::floor::GrantBroadcast::None => {}
     }
 
     match action {
@@ -2380,79 +2268,6 @@ async fn enforce_floor_lease(
         | crate::floor::IngestFloorAction::Opened
         | crate::floor::IngestFloorAction::Published(_) => Ok(()),
     }
-}
-
-/// Handle a `kind:20003` floor-request event (see `crate::floor_wire`).
-///
-/// Thin I/O wiring over [`resolve_floor_lease`] and
-/// [`crate::floor::FloorLease::request`]: resolve the channel's floor
-/// context, opportunistically reclaim an expired holder
-/// (`FloorLease::reclaim_if_expired`, same "reclaim before deciding"
-/// discipline as `evaluate_floor_at_ingest`), then request the floor on the
-/// requester's behalf. A `Granted` decision fans out a `kind:39007` grant
-/// (`crate::handlers::side_effects::emit_floor_grant`); `Queued` and
-/// `DeniedBudgetExhausted` emit nothing, matching the "no grant unless
-/// granted" wire rule.
-///
-/// Returns `Ok(())` in every case except a resolution failure: a
-/// non-floor-enforced channel, a non-agent requester, or an unparseable
-/// requester pubkey are all no-ops rather than rejections, since the
-/// request is an ephemeral, best-effort event with no durable state to
-/// protect. Mirrors [`handle_ephemeral_event`]'s `Result<(), String>`
-/// convention so the WS command loop can send one uniform `OK`.
-pub(crate) async fn handle_floor_request(
-    state: &Arc<AppState>,
-    tenant: &TenantContext,
-    channel_id: Uuid,
-    requester: &nostr::PublicKey,
-) -> Result<(), String> {
-    use buzz_sdk::broker::PubkeyHex;
-
-    let channel_row = state.db.get_channel(tenant.community(), channel_id).await.ok();
-    let ctx = match resolve_floor_lease(state, tenant, channel_id, channel_row.as_ref()).await {
-        Ok(Some(ctx)) => ctx,
-        Ok(None) => return Ok(()),
-        Err(IngestError::Rejected(m) | IngestError::AuthFailed(m) | IngestError::Internal(m)) => {
-            return Err(m);
-        }
-    };
-
-    let Ok(requester_hex) = PubkeyHex::parse(requester.to_hex()) else {
-        tracing::warn!(
-            channel_id = %channel_id,
-            "floor request ignored: requester pubkey failed hex parse"
-        );
-        return Ok(());
-    };
-
-    if !ctx.agent_pubkeys.iter().any(|a| a == &requester_hex) {
-        // Only agents participate in the floor protocol; a non-agent
-        // requester is ignored rather than rejected (ephemeral, best-effort).
-        return Ok(());
-    }
-
-    let now = std::time::Instant::now();
-    let (decision, revision) = {
-        let mut guard = ctx.lease.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        // Opportunistic reclaim: a held-but-expired floor is released before
-        // this request is judged, same discipline as evaluate_floor_at_ingest.
-        guard.reclaim_if_expired(now);
-        let decision = guard.request(&requester_hex, now);
-        (decision, guard.revision())
-    };
-
-    if matches!(decision, crate::floor::FloorDecision::Granted) {
-        crate::handlers::side_effects::emit_floor_grant(
-            tenant,
-            state,
-            channel_id,
-            &requester_hex,
-            revision,
-            crate::floor::DEFAULT_FLOOR_TTL,
-        );
-    }
-
-    Ok(())
 }
 
 /// Ingest a signed Nostr event through the full validation pipeline.
