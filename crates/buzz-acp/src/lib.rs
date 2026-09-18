@@ -5443,6 +5443,7 @@ mod author_gate_tests {
             base_url: "http://localhost:0".into(),
             keys: nostr::Keys::generate(),
             auth_tag_json: None,
+            relay_self_pubkey_cache: Default::default(),
         }
     }
 
@@ -5744,6 +5745,7 @@ mod author_gate_tests {
             base_url,
             keys: nostr::Keys::generate(),
             auth_tag_json: None,
+            relay_self_pubkey_cache: Default::default(),
         };
         (
             pool::ChannelInfoResolver::new(HashMap::new(), rest),

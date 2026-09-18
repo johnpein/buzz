@@ -519,6 +519,7 @@ mod tests {
             base_url: "http://127.0.0.1:1".to_string(),
             keys: Keys::generate(),
             auth_tag_json: None,
+            relay_self_pubkey_cache: Default::default(),
         };
         let members = vec![("aa".to_string(), "member".to_string())];
         let enforced = resolve_floor_enforcement("dm", &members, "aa", "bb", &rest_client).await;
@@ -532,6 +533,7 @@ mod tests {
             base_url: "http://127.0.0.1:1".to_string(),
             keys: Keys::generate(),
             auth_tag_json: None,
+            relay_self_pubkey_cache: Default::default(),
         };
         let enforced = resolve_floor_enforcement("stream", &[], "aa", "bb", &rest_client).await;
         assert!(!enforced, "no roster to check means no other agent found");

@@ -254,6 +254,12 @@ pub struct RestClient {
     pub keys: Keys,
     /// Optional NIP-OA auth tag JSON for `x-auth-tag` header (relay membership delegation).
     pub auth_tag_json: Option<String>,
+    /// Process/client-lifetime cache for the relay's stable NIP-29 group-state
+    /// signing pubkey (see [`Self::fetch_relay_self_pubkey`]). Wrapped in `Arc`
+    /// so every `Clone` of this `RestClient` (it is deliberately cheap to clone
+    /// and shared across spawned prompt tasks — see [`HarnessRelay::rest_client`])
+    /// shares the same cache rather than each clone re-fetching independently.
+    pub relay_self_pubkey_cache: std::sync::Arc<tokio::sync::OnceCell<String>>,
 }
 
 /// Whether an HTTP status code is retriable (transient server/rate-limit errors).
@@ -503,7 +509,25 @@ impl RestClient {
     /// verifying NIP-29 group-state events). A relay running on an ephemeral
     /// key (no stable identity) has no `self` and this fails closed — there is
     /// no authority to verify group membership against.
+    ///
+    /// The relay's self pubkey is static for the relay's lifetime, so a
+    /// successful fetch is cached in `relay_self_pubkey_cache` (process/client
+    /// lifetime — every membership-verifying delivery, including DMs, used to
+    /// pay a fresh `/info` round-trip here). `get_or_try_init` only commits a
+    /// value on `Ok`: a failed fetch (timeout, missing/malformed `self`) is
+    /// never cached, so the cell stays empty and the next call retries the
+    /// fetch from scratch rather than pinning a permissive default — the same
+    /// cache-on-success-only discipline `buzz-agent`'s `models_cache` uses for
+    /// `resolve_models_catalog`.
     pub async fn fetch_relay_self_pubkey(&self) -> Result<String, RelayError> {
+        self.relay_self_pubkey_cache
+            .get_or_try_init(|| self.fetch_relay_self_pubkey_uncached())
+            .await
+            .cloned()
+    }
+
+    /// Uncached `GET /info` fetch behind [`Self::fetch_relay_self_pubkey`]'s cache.
+    async fn fetch_relay_self_pubkey_uncached(&self) -> Result<String, RelayError> {
         let url = format!("{}/info", self.base_url);
         let resp = self
             .request_with_retry("GET", "/info", || self.http.get(&url).send())
@@ -857,6 +881,7 @@ impl HarnessRelay {
                 .auth_tag
                 .as_ref()
                 .and_then(|t| serde_json::to_string(t.as_slice()).ok()),
+            relay_self_pubkey_cache: Default::default(),
         }
     }
 
@@ -6558,6 +6583,148 @@ mod tests {
         assert!(
             !state.channel_dropped_since.contains_key(&channel_id),
             "channel_dropped_since must be cleared on successful drain"
+        );
+    }
+
+    // ── relay self-pubkey cache (Task 7 hardening) ─────────────────────────
+
+    /// Spawns a minimal HTTP server on `127.0.0.1` that answers every request
+    /// with `status_line` + `body`, and counts how many requests actually
+    /// reached it. Mirrors `counting_resolver` in `pool.rs`'s test module —
+    /// counting real requests is the point: a pure unit test of `OnceCell`
+    /// semantics alone cannot observe whether `fetch_relay_self_pubkey`'s HTTP
+    /// call was actually skipped on the cached path.
+    async fn counting_info_server(
+        status_line: &'static str,
+        body: String,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test /info server");
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let server_requests = requests.clone();
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = vec![0; 8192];
+                let _ = socket.read(&mut buf).await;
+                server_requests.fetch_add(1, Ordering::SeqCst);
+                let response = format!(
+                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        (base_url, requests, server)
+    }
+
+    fn rest_client_for(base_url: String) -> RestClient {
+        RestClient {
+            http: reqwest::Client::new(),
+            base_url,
+            keys: Keys::generate(),
+            auth_tag_json: None,
+            relay_self_pubkey_cache: Default::default(),
+        }
+    }
+
+    /// A successful fetch is cached: a second `fetch_relay_self_pubkey` call
+    /// on the same `RestClient` must not issue a second `/info` request.
+    ///
+    /// Regression coverage for the Task 7 hardening — Task 5's
+    /// `fetch_verified_channel_members` called `fetch_relay_self_pubkey` on
+    /// every trusted delivery (including DMs, via
+    /// `build_verified_buzz_prompt_params_for_batch` in `pool.rs`); this
+    /// proves the fetch now happens at most once per `RestClient` (which is
+    /// process/client-lifetime and shared across clones via the `Arc`-wrapped
+    /// cache field).
+    #[tokio::test]
+    async fn fetch_relay_self_pubkey_caches_successful_fetch() {
+        let expected = "a".repeat(64);
+        let (base_url, requests, _server) =
+            counting_info_server("HTTP/1.1 200 OK", format!(r#"{{"self":"{expected}"}}"#)).await;
+        let rest = rest_client_for(base_url);
+
+        let first = rest
+            .fetch_relay_self_pubkey()
+            .await
+            .expect("first fetch must succeed");
+        assert_eq!(first, expected);
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "first call must hit the server exactly once"
+        );
+
+        let second = rest
+            .fetch_relay_self_pubkey()
+            .await
+            .expect("cached fetch must succeed");
+        assert_eq!(
+            second, expected,
+            "cached value must match the originally fetched value"
+        );
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "second call must be served from cache, not a second /info request"
+        );
+    }
+
+    /// Fail-closed: when the cache has never been successfully populated and
+    /// the fetch fails (here, a relay info document with no `self` field —
+    /// an ephemeral-identity relay), `fetch_relay_self_pubkey` must return an
+    /// `Err`, never a cached/permissive default — a failed lookup must still
+    /// reject the delivery. A second attempt against a now-healthy relay,
+    /// reusing the SAME cache handle, must succeed rather than replaying the
+    /// earlier failure: `get_or_try_init` only commits the cache on `Ok`, so
+    /// a failure never poisons it (mirrors buzz-agent's
+    /// `models_cache_does_not_pin_on_discovery_error`).
+    #[tokio::test]
+    async fn fetch_relay_self_pubkey_fails_closed_when_never_cached() {
+        let (base_url, requests, _server) =
+            counting_info_server("HTTP/1.1 200 OK", "{}".to_string()).await;
+        let rest = rest_client_for(base_url);
+
+        let err = rest
+            .fetch_relay_self_pubkey()
+            .await
+            .expect_err("relay with no stable signing key must fail closed");
+        assert!(
+            matches!(&err, RelayError::Http(msg) if msg.contains("no stable signing key")),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the failing fetch must still have been attempted"
+        );
+
+        // Reuse the same cache handle against a server that now succeeds.
+        let expected = "b".repeat(64);
+        let (base_url2, requests2, _server2) =
+            counting_info_server("HTTP/1.1 200 OK", format!(r#"{{"self":"{expected}"}}"#)).await;
+        let mut retry_rest = rest_client_for(base_url2);
+        retry_rest.relay_self_pubkey_cache = rest.relay_self_pubkey_cache.clone();
+
+        let recovered = retry_rest
+            .fetch_relay_self_pubkey()
+            .await
+            .expect("retry after a fixed relay must succeed, not stay poisoned");
+        assert_eq!(recovered, expected);
+        assert_eq!(
+            requests2.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the earlier failure must not have pinned the cache: the retry must reach the relay"
         );
     }
 }
