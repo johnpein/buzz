@@ -63,6 +63,63 @@ pub fn is_floor_enforced(
     agent_count >= 2
 }
 
+/// Pure parse-and-match for the floor gate's channel-type check: true only
+/// for the [`ChannelType::Stream`] variant. Extracted from
+/// `enforce_floor_lease` (`crates/buzz-relay/src/handlers/ingest.rs`) so the
+/// DM-bypass parse has direct unit coverage instead of resting on inference
+/// from the `FloorLease` state-machine tests. `raw` is a stored
+/// `channel_type` value (e.g. `"stream"`, `"dm"`, `"forum"`).
+#[must_use]
+pub fn is_enforced_channel_type(raw: &str) -> bool {
+    raw.parse::<ChannelType>().ok() == Some(ChannelType::Stream)
+}
+
+/// A channel roster member as classified for floor-gate authorization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberKind {
+    /// `users.agent_owner_pubkey IS NOT NULL` for this pubkey.
+    Agent,
+    /// `users.agent_owner_pubkey IS NULL` for this pubkey — a definite,
+    /// successfully looked-up human.
+    Human,
+}
+
+/// The floor-gate agent-membership lookup could not determine whether a
+/// roster member is human or an agent — a DB error or an unknown pubkey, per
+/// [`classify_member`]'s doc comment. Carries no payload: the caller
+/// (`enforce_floor_lease`) always turns this into a generic
+/// `IngestError::Internal` and the DB error detail, when there is one, is
+/// already logged/traced at the lookup site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("floor-gate agent classification is indeterminate")]
+pub struct IndeterminateMember;
+
+/// Fail-closed classification of a floor-gate roster lookup.
+///
+/// `lookup` is `Ok(is_agent)` when the caller's DB read of this pubkey's
+/// `agent_owner_pubkey` succeeded and found a row; it is
+/// `Err(IndeterminateMember)` for anything that didn't produce that
+/// evidence — a DB error or an unknown pubkey both count, since neither
+/// tells us the member is human.
+///
+/// This is deliberately the opposite of the ingest metrics-label lookup
+/// (`author_type_label` in `handlers::ingest`, which is documented
+/// "Metric-labeling only — never used for authorization" and collapses
+/// `Ok(None) | Err(_)` to `false`/"human"). That collapse is a fail-open
+/// path: for floor-gate authorization it would let a misclassified agent
+/// get treated as the channel owner and reset the floor. `classify_member`
+/// never maps `Err(IndeterminateMember)` to [`MemberKind::Human`] — the
+/// caller (`enforce_floor_lease`) instead propagates it as an ingest error,
+/// so an indeterminate lookup rejects/retries the publish rather than
+/// silently admitting it.
+pub fn classify_member(lookup: Result<bool, IndeterminateMember>) -> Result<MemberKind, IndeterminateMember> {
+    match lookup {
+        Ok(true) => Ok(MemberKind::Agent),
+        Ok(false) => Ok(MemberKind::Human),
+        Err(e) => Err(e),
+    }
+}
+
 /// Outcome of an agent's request to speak.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FloorDecision {
@@ -406,5 +463,51 @@ mod tests {
             f.on_publish(&stacy(), t0()),
             Err(FloorError::NotHolder)
         ));
+    }
+
+    // --- is_enforced_channel_type: proves the DM-bypass parse directly,
+    // rather than by inference from the FloorLease tests above. ---
+
+    #[test]
+    fn stream_channel_type_is_enforced() {
+        assert!(is_enforced_channel_type("stream"));
+    }
+
+    #[test]
+    fn dm_channel_type_is_not_enforced() {
+        assert!(!is_enforced_channel_type("dm"));
+    }
+
+    #[test]
+    fn forum_channel_type_is_not_enforced() {
+        assert!(!is_enforced_channel_type("forum"));
+    }
+
+    #[test]
+    fn unknown_and_garbage_channel_types_are_not_enforced() {
+        assert!(!is_enforced_channel_type("not-a-real-channel-type"));
+        assert!(!is_enforced_channel_type(""));
+    }
+
+    // --- classify_member: proves the fail-closed mapping directly. ---
+
+    #[test]
+    fn classify_member_maps_known_agent() {
+        assert_eq!(classify_member(Ok(true)), Ok(MemberKind::Agent));
+    }
+
+    #[test]
+    fn classify_member_maps_known_human() {
+        assert_eq!(classify_member(Ok(false)), Ok(MemberKind::Human));
+    }
+
+    #[test]
+    fn classify_member_fails_closed_on_indeterminate_lookup() {
+        // Neither a DB error nor an unknown pubkey is evidence of humanness,
+        // so both must stay Err — never silently become MemberKind::Human.
+        assert_eq!(
+            classify_member(Err(IndeterminateMember)),
+            Err(IndeterminateMember)
+        );
     }
 }

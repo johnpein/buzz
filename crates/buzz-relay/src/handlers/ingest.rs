@@ -2173,18 +2173,51 @@ async fn author_type_label(
     }
 }
 
+/// Fail-closed agent-membership lookup for the floor gate
+/// (`enforce_floor_lease`). Unlike [`author_type_label`] (metric-labeling
+/// only, deliberately fail-open: `Ok(None) | Err(_) => false`/"human"), this
+/// feeds a security-relevant authorization decision, so a DB error and an
+/// unknown pubkey both collapse to `Err(IndeterminateMember)` ("cannot
+/// determine") instead of `Ok(false)` ("human"). Bypasses
+/// `author_type_cache`, which is populated under the fail-open policy and
+/// would otherwise re-surface a previously-coerced "human" for an
+/// errored/unknown lookup. See [`crate::floor::classify_member`] for how the
+/// caller turns this into a [`crate::floor::MemberKind`].
+async fn floor_gate_agent_lookup(
+    state: &Arc<AppState>,
+    community: CommunityId,
+    pubkey_bytes: &[u8],
+) -> Result<bool, crate::floor::IndeterminateMember> {
+    match state.db.get_agent_channel_policy(community, pubkey_bytes).await {
+        Ok(Some((_, owner))) => Ok(owner.is_some()),
+        Ok(None) => Err(crate::floor::IndeterminateMember),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "floor gate agent-membership lookup failed; failing closed"
+            );
+            Err(crate::floor::IndeterminateMember)
+        }
+    }
+}
+
 /// Enforce the group-chat floor lease for a kind:9 (stream message) publish.
 ///
 /// Thin I/O wiring over the pure [`crate::floor::evaluate_floor_at_ingest`]
 /// decision (`crates/buzz-relay/src/floor.rs`): resolve the real channel type,
 /// the channel roster, and which roster members are agents
-/// (`users.agent_owner_pubkey IS NOT NULL` — the same signal as
-/// [`author_type_label`] and buzz-acp's NIP-OA sibling gate), then consult the
-/// channel's cached [`crate::floor::FloorLease`]. Non-stream channels return
-/// early without even loading the roster, so ordinary DMs are byte-unaffected.
-/// A publish by an agent that does not hold the floor is rejected through the
-/// same [`IngestError::Rejected`] surface the membership-revision CAS check
-/// uses, so buzz-acp's existing publish-rejection back-off/requeue handles it.
+/// (`users.agent_owner_pubkey IS NOT NULL`, looked up fail-closed via
+/// [`floor_gate_agent_lookup`] — the same underlying signal as buzz-acp's
+/// NIP-OA sibling gate, but never coerced to "human" on error), then consult
+/// the channel's cached [`crate::floor::FloorLease`]. Non-stream channels
+/// return early without even loading the roster, so ordinary DMs are
+/// byte-unaffected. A publish by an agent that does not hold the floor is
+/// rejected through the same [`IngestError::Rejected`] surface the
+/// membership-revision CAS check uses, so buzz-acp's existing
+/// publish-rejection back-off/requeue handles it. An indeterminate agent
+/// classification (DB error or unknown pubkey) is rejected the same way,
+/// via [`IngestError::Internal`], rather than ever being treated as a human
+/// owner message that would reset the floor.
 async fn enforce_floor_lease(
     state: &Arc<AppState>,
     tenant: &TenantContext,
@@ -2198,8 +2231,8 @@ async fn enforce_floor_lease(
     // Authoritative enforcement gate (design requirement 1): only stream
     // channels are floor-enforced. DMs/forums bypass before any roster load.
     let is_stream = channel_row
-        .and_then(|row| row.channel_type.parse::<ChannelType>().ok())
-        == Some(ChannelType::Stream);
+        .map(|row| crate::floor::is_enforced_channel_type(&row.channel_type))
+        .unwrap_or(false);
     if !is_stream {
         return Ok(());
     }
@@ -2210,12 +2243,24 @@ async fn enforce_floor_lease(
         .await
         .map_err(|e| IngestError::Internal(format!("error: floor roster load: {e}")))?;
 
-    // Resolve which roster members are agents, reusing the cached agent signal.
+    // Resolve which roster members are agents. Fail-closed: an indeterminate
+    // classification for any member aborts the publish via IngestError rather
+    // than silently treating that member as human (see floor_gate_agent_lookup
+    // and crate::floor::classify_member).
     let mut agent_pubkeys = Vec::new();
     for member in &members {
-        if author_type_label(state, tenant, member.pubkey.clone()).await == "agent" {
-            if let Ok(hex) = PubkeyHex::parse(hex::encode(&member.pubkey)) {
-                agent_pubkeys.push(hex);
+        let lookup = floor_gate_agent_lookup(state, tenant.community(), &member.pubkey).await;
+        match crate::floor::classify_member(lookup) {
+            Ok(crate::floor::MemberKind::Agent) => {
+                if let Ok(hex) = PubkeyHex::parse(hex::encode(&member.pubkey)) {
+                    agent_pubkeys.push(hex);
+                }
+            }
+            Ok(crate::floor::MemberKind::Human) => {}
+            Err(crate::floor::IndeterminateMember) => {
+                return Err(IngestError::Internal(format!(
+                    "error: floor agent classification indeterminate for a member of channel {channel_id}"
+                )));
             }
         }
     }
@@ -2223,6 +2268,12 @@ async fn enforce_floor_lease(
     let Ok(author_hex) = PubkeyHex::parse(author.to_hex()) else {
         // Unparseable author: leave ingest untouched rather than add a failure
         // path (the author already passed signature + identity checks upstream).
+        // Defense-in-depth: log so a silent enforcement bypass is observable,
+        // even though this is realistically unreachable.
+        tracing::warn!(
+            channel_id = %channel_id,
+            "floor lease enforcement skipped: author pubkey failed hex parse"
+        );
         return Ok(());
     };
 
