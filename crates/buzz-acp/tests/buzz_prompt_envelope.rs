@@ -85,9 +85,31 @@ fn attestation_is_valid(envelope: &Value, pinned_agent: &PublicKey) -> bool {
     };
     if attestation["algorithm"] != "bip340-sha256"
         || attestation["signerPubkey"] != pinned_agent.to_hex()
-        || envelope["channel"]["agentPubkey"] != pinned_agent.to_hex()
     {
         return false;
+    }
+    // dm framing carries the 2-party `agentPubkey` shorthand; stream framing
+    // drops it in favor of the full `members[]` roster (see buzz_envelope.rs)
+    // — so the cross-check differs by whichever framing is actually present.
+    match envelope["channel"].get("agentPubkey") {
+        Some(agent_pubkey) => {
+            if *agent_pubkey != json!(pinned_agent.to_hex()) {
+                return false;
+            }
+        }
+        None => {
+            let in_roster = envelope["channel"]["members"]
+                .as_array()
+                .map(|members| {
+                    members
+                        .iter()
+                        .any(|member| member["pubkey"] == json!(pinned_agent.to_hex()))
+                })
+                .unwrap_or(false);
+            if !in_roster {
+                return false;
+            }
+        }
     }
 
     let mut payload = envelope.clone();
@@ -1002,6 +1024,206 @@ fn job_title_rejects_format_and_separator_characters() {
             "format/separator character {bad:?} in a content-derived job title must reject the delivery",
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Stream (group) channel: roster >= 2, owner present, acting agent present,
+// author admitted iff owner or roster member. DM behavior above stays
+// untouched by every helper added below.
+// ---------------------------------------------------------------------------
+
+struct StreamFixture {
+    owner: Keys,
+    agent: Keys,
+    sibling: Keys,
+    members: [(String, String); 3],
+}
+
+impl StreamFixture {
+    fn new() -> Self {
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let sibling = Keys::generate();
+        let members = [
+            (owner.public_key().to_hex(), "owner".to_string()),
+            (agent.public_key().to_hex(), "member".to_string()),
+            (sibling.public_key().to_hex(), "member".to_string()),
+        ];
+        Self {
+            owner,
+            agent,
+            sibling,
+            members,
+        }
+    }
+
+    fn sign_event_with(&self, keys: &Keys, kind: u16, content: &str) -> Event {
+        let tags = vec![
+            nostr::Tag::parse(["h", FIXTURE_CHANNEL]).expect("valid channel tag"),
+            nostr::Tag::parse(["p", &self.agent.public_key().to_hex()])
+                .expect("valid agent mention"),
+        ];
+        nostr::EventBuilder::new(nostr::Kind::Custom(kind), content)
+            .tags(tags)
+            .sign_with_keys(keys)
+            .expect("sign fixture")
+    }
+
+    fn build_with_members(
+        &self,
+        events: &[Event],
+        members: &[(String, String)],
+    ) -> anyhow::Result<Value> {
+        buzz_acp::build_verified_buzz_prompt_params_for_test(buzz_acp::VerifiedBuzzPromptInput {
+            session_id: "session-1",
+            prompt_blocks: &["rendered prompt"],
+            channel_id: FIXTURE_CHANNEL,
+            channel_type: "stream",
+            owner_pubkey: &self.owner.public_key().to_hex(),
+            agent_keys: &self.agent,
+            members,
+            events,
+        })
+    }
+
+    fn build(&self, events: &[Event]) -> anyhow::Result<Value> {
+        self.build_with_members(events, &self.members)
+    }
+}
+
+#[test]
+fn stream_channel_three_members_owner_authored_is_accepted() {
+    let fixture = StreamFixture::new();
+    let chat = fixture.sign_event_with(&fixture.owner.clone(), 9, "hi from owner");
+    let params = fixture
+        .build(std::slice::from_ref(&chat))
+        .expect("owner-authored 3-member stream envelope must be accepted");
+    let envelope = &params["_meta"]["buzz"];
+    assert_eq!(envelope["channel"]["type"], json!("stream"));
+    assert_eq!(envelope["channel"]["members"].as_array().unwrap().len(), 3);
+    assert!(attestation_is_valid(envelope, &fixture.agent.public_key()));
+}
+
+#[test]
+fn stream_channel_three_members_sibling_authored_is_accepted() {
+    // The new case: a sibling agent (e.g. Stacy) present in the roster, but
+    // not the acting agent for this envelope build, authors the inbound
+    // chat event.
+    let fixture = StreamFixture::new();
+    let chat = fixture.sign_event_with(&fixture.sibling.clone(), 9, "hi from stacy");
+    let params = fixture
+        .build(std::slice::from_ref(&chat))
+        .expect("sibling-authored stream envelope must be accepted");
+    let envelope = &params["_meta"]["buzz"];
+    assert_eq!(envelope["channel"]["type"], json!("stream"));
+    assert!(attestation_is_valid(envelope, &fixture.agent.public_key()));
+}
+
+#[test]
+fn stream_roster_with_bot_or_guest_role_is_rejected() {
+    let fixture = StreamFixture::new();
+    let chat = fixture.sign_event_with(&fixture.owner.clone(), 9, "hi");
+    for bad_role in ["bot", "guest"] {
+        let mut members = fixture.members.clone();
+        members[2].1 = bad_role.to_string();
+        assert!(
+            fixture
+                .build_with_members(std::slice::from_ref(&chat), &members)
+                .is_err(),
+            "a stream roster containing a {bad_role} role must be rejected",
+        );
+    }
+}
+
+#[test]
+fn stream_author_not_in_roster_is_rejected() {
+    let fixture = StreamFixture::new();
+    let outsider = Keys::generate();
+    let chat = fixture.sign_event_with(&outsider, 9, "hi from nobody");
+    assert!(
+        fixture.build(std::slice::from_ref(&chat)).is_err(),
+        "an author outside the roster must be rejected even in a stream channel",
+    );
+}
+
+#[test]
+fn stream_roster_missing_acting_agent_is_rejected() {
+    let fixture = StreamFixture::new();
+    let chat = fixture.sign_event_with(&fixture.owner.clone(), 9, "hi");
+    let agent_pubkey = fixture.agent.public_key().to_hex();
+    let members_without_agent: Vec<(String, String)> = fixture
+        .members
+        .iter()
+        .filter(|(pubkey, _)| pubkey != &agent_pubkey)
+        .cloned()
+        .collect();
+    assert!(
+        fixture
+            .build_with_members(std::slice::from_ref(&chat), &members_without_agent)
+            .is_err(),
+        "a stream roster missing the acting agent must be rejected",
+    );
+}
+
+#[test]
+fn stream_channel_framing_uses_full_roster_not_two_party_shorthand() {
+    let fixture = StreamFixture::new();
+    let chat = fixture.sign_event_with(&fixture.owner.clone(), 9, "hi");
+    let params = fixture
+        .build(std::slice::from_ref(&chat))
+        .expect("stream envelope");
+    let envelope = &params["_meta"]["buzz"];
+    // `ownerPubkey` stays (attach_request depends on it unconditionally);
+    // the singular `agentPubkey` 2-party shorthand is dropped in favor of
+    // the full `members[]` roster.
+    assert_exact_keys(
+        &envelope["channel"],
+        &["id", "type", "ownerPubkey", "members", "membershipRevision"],
+        "stream channel framing",
+    );
+    let members = envelope["channel"]["members"]
+        .as_array()
+        .expect("members array");
+    assert_eq!(
+        members.len(),
+        3,
+        "stream channel framing must carry the full roster"
+    );
+}
+
+#[test]
+fn legacy_dm_two_member_owner_authored_envelope_framing_is_unchanged() {
+    // Regression: the dm path must remain byte-identical after the stream
+    // relaxation lands.
+    let fixture = Fixture::new();
+    let chat = fixture.sign_event(9, Vec::new());
+    let params = fixture
+        .build(std::slice::from_ref(&chat))
+        .expect("legacy dm envelope must still build");
+    let envelope = &params["_meta"]["buzz"];
+    assert_eq!(envelope["channel"]["type"], json!("dm"));
+    assert_exact_keys(
+        &envelope["channel"],
+        &[
+            "id",
+            "type",
+            "ownerPubkey",
+            "agentPubkey",
+            "members",
+            "membershipRevision",
+        ],
+        "legacy dm channel framing",
+    );
+    assert_eq!(
+        envelope["channel"]["ownerPubkey"],
+        json!(fixture.owner.public_key().to_hex()),
+    );
+    assert_eq!(
+        envelope["channel"]["agentPubkey"],
+        json!(fixture.agent.public_key().to_hex()),
+    );
+    assert_eq!(envelope["channel"]["members"].as_array().unwrap().len(), 2);
+    assert!(attestation_is_valid(envelope, &fixture.agent.public_key()));
 }
 
 #[test]

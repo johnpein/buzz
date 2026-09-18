@@ -49,8 +49,8 @@ pub fn build_verified_buzz_prompt_params(input: VerifiedBuzzPromptInput<'_>) -> 
         members,
         events,
     } = input;
-    if channel_type != "dm" {
-        bail!("Buzz P0 accepts owner DMs only");
+    if channel_type != "dm" && channel_type != "stream" {
+        bail!("Buzz P0 accepts owner DMs or stream group channels only");
     }
     let owner_pubkey = normalize_pubkey(owner_pubkey)?;
     let agent_pubkey = agent_keys.public_key().to_hex().to_ascii_lowercase();
@@ -78,15 +78,37 @@ pub fn build_verified_buzz_prompt_params(input: VerifiedBuzzPromptInput<'_>) -> 
             .as_bytes()
             .cmp(right["pubkey"].as_str().unwrap_or_default().as_bytes())
     });
-    if members.len() != 2
-        || !members
-            .iter()
-            .any(|member| member["pubkey"] == owner_pubkey && member["role"] == "member")
-        || !members
-            .iter()
-            .any(|member| member["pubkey"] == agent_pubkey && member["role"] == "member")
-    {
-        bail!("Buzz P0 requires the exact owner and managed-agent DM participant set");
+    if channel_type == "dm" {
+        // Unchanged DM rule: exactly the owner and the managed agent, both
+        // carrying the "member" role, and no one else.
+        if members.len() != 2
+            || !members
+                .iter()
+                .any(|member| member["pubkey"] == owner_pubkey && member["role"] == "member")
+            || !members
+                .iter()
+                .any(|member| member["pubkey"] == agent_pubkey && member["role"] == "member")
+        {
+            bail!("Buzz P0 requires the exact owner and managed-agent DM participant set");
+        }
+    } else {
+        // channel_type == "stream" (the only other value admitted above). A
+        // group roster of two or more members, all already role-validated
+        // above, must still contain the owner and the acting agent —
+        // additional (e.g. sibling-agent) members are otherwise unrestricted
+        // here; author admission is enforced separately per inbound event.
+        if members.len() < 2
+            || !members
+                .iter()
+                .any(|member| member["pubkey"] == owner_pubkey)
+            || !members
+                .iter()
+                .any(|member| member["pubkey"] == agent_pubkey)
+        {
+            bail!(
+                "Buzz P0 stream channel requires the owner and the acting agent present in the roster"
+            );
+        }
     }
 
     let channel_id = uuid::Uuid::parse_str(channel_id)
@@ -106,8 +128,16 @@ pub fn build_verified_buzz_prompt_params(input: VerifiedBuzzPromptInput<'_>) -> 
         }
         let kind = event.kind.as_u16() as u32;
         if kind == 9 {
-            if event.pubkey.to_hex().to_ascii_lowercase() != owner_pubkey {
-                bail!("Buzz P0 accepts only owner-authored inbound chat events");
+            let author = event.pubkey.to_hex().to_ascii_lowercase();
+            // DM: owner-authored only (unchanged). Stream: the owner, or any
+            // roster member already role-validated above — this is how a
+            // sibling agent (e.g. Stacy) is admitted as an author alongside
+            // the acting agent, without widening the DM trust boundary.
+            let author_is_admitted = author == owner_pubkey
+                || (channel_type == "stream"
+                    && members.iter().any(|member| member["pubkey"] == author));
+            if !author_is_admitted {
+                bail!("Buzz P0 accepts only owner- or roster-member-authored inbound chat events");
             }
             chat_events.push(event);
         } else if job_action(kind).is_some() {
@@ -135,14 +165,33 @@ pub fn build_verified_buzz_prompt_params(input: VerifiedBuzzPromptInput<'_>) -> 
         .transpose()?;
 
     let membership_revision = membership_revision(&channel_id, &members)?;
-    let channel = json!({
-        "id": channel_id,
-        "type": "dm",
-        "ownerPubkey": owner_pubkey,
-        "agentPubkey": agent_pubkey,
-        "members": members,
-        "membershipRevision": membership_revision,
-    });
+    let channel = if channel_type == "dm" {
+        // Unchanged DM framing (byte-identical to pre-stream behavior).
+        json!({
+            "id": channel_id,
+            "type": "dm",
+            "ownerPubkey": owner_pubkey,
+            "agentPubkey": agent_pubkey,
+            "members": members,
+            "membershipRevision": membership_revision,
+        })
+    } else {
+        // Stream framing drops the 2-party `agentPubkey` shorthand — once the
+        // roster can hold more than one agent identity (acting + sibling),
+        // no single pubkey deserves that slot — and relies on the full
+        // `members[]` roster instead. `ownerPubkey` is kept: it is not part
+        // of the shorthand being replaced, and `attach_request` in
+        // trusted_transport.rs reads `/channel/ownerPubkey`
+        // unconditionally (for both channel types) to bind the outbound
+        // reply's owner mention.
+        json!({
+            "id": channel_id,
+            "type": "stream",
+            "ownerPubkey": owner_pubkey,
+            "members": members,
+            "membershipRevision": membership_revision,
+        })
+    };
     let anchor = chat_events
         .last()
         .ok_or_else(|| anyhow!("missing reply anchor"))?;
