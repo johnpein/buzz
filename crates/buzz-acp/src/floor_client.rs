@@ -26,20 +26,20 @@
 //!   have taken — never two agents talking over each other. Signature
 //!   verification is therefore a defense-in-depth nice-to-have, not a
 //!   correctness requirement, and is left out of this pass.
-//! - **`BudgetExhausted` is a conflated name.** The wire only ever gives a
-//!   client two distinguishable shapes: an explicit `kind:39007` (naming a
-//!   holder, or `status=open` with no holder) or silence. Silence is what
-//!   the relay's real per-owner-turn budget exhaustion looks like on the
-//!   wire (`handlers::floor_glue::handle_floor_request` emits *no* grant on
-//!   `FloorDecision::DeniedBudgetExhausted` — see that module's doc comment)
-//!   — so genuine budget exhaustion and a slow/dead relay are indistinguishable
-//!   from here and both surface as [`FloorAcquire::TimedOut`]. An *explicit*
-//!   grant that simply doesn't name this agent (a legitimate round-robin
-//!   turn for a sibling, or the TTL-reclaim `status=open` clear) is the one
-//!   case this client CAN tell apart from silence, and is reported as
-//!   [`FloorAcquire::BudgetExhausted`] even though it is not always literally
-//!   budget exhaustion. Both variants resolve identically at the call site
-//!   (skip the turn, stay quiet), so the distinction is diagnostic only.
+//! - **`BudgetExhausted` covers every decisive "not my turn" shape.** The
+//!   relay emits an explicit `kind:39007` for each of them: a grant naming a
+//!   sibling (a legitimate round-robin turn), the TTL-reclaim `status=open`
+//!   clear, and — since Follow-up (a), 2026-09-18 — a `status=closed` on real
+//!   per-owner-turn budget exhaustion (`handlers::floor_glue` emits it on
+//!   `FloorDecision::DeniedBudgetExhausted`, and `enforce_floor_lease` on the
+//!   `GrantBroadcast::Closed` a budget-exhausting publish produces). All are
+//!   decisive events this client tells apart from silence, and all resolve to
+//!   [`FloorAcquire::BudgetExhausted`] — the name predates the explicit
+//!   `closed` signal and is now literally accurate for the budget-exhaustion
+//!   case. [`FloorAcquire::TimedOut`] is therefore left to mean only what it
+//!   should: a slow, dead, or unreachable relay that sent nothing at all.
+//!   Both non-granting outcomes resolve identically at the call site (skip the
+//!   turn, stay quiet), so the distinction between them is diagnostic only.
 
 use std::future::Future;
 use std::time::Duration;
@@ -59,15 +59,16 @@ pub(crate) enum FloorAcquire {
     /// with the Context Engine turn and publish.
     Granted,
     /// An explicit, decisive `kind:39007` arrived before the timeout that
-    /// does NOT grant this agent the floor: either `status=open` (no
-    /// holder — e.g. a TTL reclaim with no round-robin next agent) or a
-    /// grant naming a different agent (a sibling's legitimate turn). See
-    /// the module doc for why this is named `BudgetExhausted` even though
-    /// it is not always literally the relay's budget-exhaustion path.
+    /// does NOT grant this agent the floor: a grant naming a different agent
+    /// (a sibling's legitimate turn), a `status=open` clear (a TTL reclaim
+    /// with no round-robin next agent), or a `status=closed` (the relay's
+    /// per-owner-turn budget is exhausted — Follow-up (a)). See the module
+    /// doc; all three mean "not my turn, stay quiet".
     BudgetExhausted,
-    /// No decisive `kind:39007` event was observed within the timeout —
-    /// including the relay's real budget-exhaustion path, which emits no
-    /// grant at all. See the module doc for this conflation.
+    /// No decisive `kind:39007` event was observed within the timeout. Since
+    /// Follow-up (a) the relay signals real budget exhaustion explicitly
+    /// (resolving as [`Self::BudgetExhausted`]), so this now means only a
+    /// slow, dead, or unreachable relay that sent nothing at all.
     TimedOut,
 }
 
@@ -320,6 +321,40 @@ mod tests {
         );
     }
 
+    /// Build a relay-signed `kind:39007` carrying an explicit `status` and no
+    /// holder — the wire shape of `buzz_relay::floor_wire::floor_closed_event`
+    /// (`status=closed`) and the `open` clear, reimplemented here for the same
+    /// client/server crate-boundary reason as `grant_event`.
+    fn statused_no_holder_event(relay: &Keys, channel_id: Uuid, status: &str) -> Event {
+        let channel_hex = channel_id.to_string();
+        EventBuilder::new(Kind::Custom(KIND_FLOOR_GRANT as u16), "")
+            .tags([
+                Tag::parse(["d", &channel_hex]).unwrap(),
+                Tag::parse(["h", &channel_hex]).unwrap(),
+                Tag::parse(["rev", "5"]).unwrap(),
+                Tag::parse(["status", status]).unwrap(),
+            ])
+            .sign_with_keys(relay)
+            .expect("signs")
+    }
+
+    #[test]
+    fn status_closed_with_no_holder_is_budget_exhausted() {
+        // Follow-up (a): the relay now emits an explicit status=closed
+        // kind:39007 on budget exhaustion instead of going silent. The client
+        // must resolve it exactly like status=open — a decisive "not my turn"
+        // — so acquire_floor returns at once rather than waiting out its
+        // timeout. Locks that the relay's new closed signal reaches this fast
+        // path (the client already treats any no-holder grant this way).
+        let relay = Keys::generate();
+        let agent = Keys::generate();
+        let event = statused_no_holder_event(&relay, channel(), "closed");
+        assert_eq!(
+            floor_grant_outcome(&event, channel(), &agent.public_key()),
+            Some(FloorAcquire::BudgetExhausted)
+        );
+    }
+
     #[test]
     fn grant_for_a_different_channel_is_ignored() {
         let relay = Keys::generate();
@@ -449,6 +484,31 @@ mod tests {
         .await
         .expect("submit ok");
         assert_eq!(outcome, FloorAcquire::Granted);
+    }
+
+    #[tokio::test]
+    async fn acquire_floor_resolves_budget_exhausted_immediately_on_status_closed() {
+        // The relay's explicit budget-exhausted signal (status=closed, no
+        // holder) is already queued: acquire_floor consumes it and resolves
+        // BudgetExhausted at once, never falling through to TimedOut. This is
+        // the behavior Follow-up (a) buys — before it, budget exhaustion was
+        // wire silence, so this same call had to wait out the full timeout.
+        let relay = Keys::generate();
+        let agent = Keys::generate();
+        let (tx, mut rx) = broadcast::channel(8);
+        tx.send(statused_no_holder_event(&relay, channel(), "closed"))
+            .unwrap();
+
+        let outcome = acquire_floor(
+            channel(),
+            &agent,
+            &mut rx,
+            Duration::from_secs(5),
+            noop_submit,
+        )
+        .await
+        .expect("submit ok");
+        assert_eq!(outcome, FloorAcquire::BudgetExhausted);
     }
 
     #[tokio::test(start_paused = true)]

@@ -394,6 +394,16 @@ pub enum GrantBroadcast {
     /// reclaim freed a holder during this call and there was no
     /// round-robin next agent to hand off to.
     Clear(u64),
+    /// Broadcast an explicit "floor closed" grant at `revision` — the
+    /// publish just consumed the last agent turn of the owner-turn budget,
+    /// so no agent may take the floor again until the owner speaks. Unlike
+    /// [`Self::Clear`] (floor free again), this tells a waiting agent that
+    /// requesting is futile, so its floor client stops waiting immediately
+    /// instead of burning its full acquire timeout (Follow-up (a),
+    /// 2026-09-18). Carries the lease's current revision unchanged — budget
+    /// exhaustion is not a fresh holder transition and does not bump it (see
+    /// the `revision_does_not_bump_while_queued_or_budget_denied` test).
+    Closed(u64),
     /// Nothing to broadcast.
     None,
 }
@@ -456,6 +466,14 @@ pub fn evaluate_floor_publish(
             lease.request(next, now);
             GrantBroadcast::Grant(next.clone(), lease.revision())
         }
+        // A holder's publish that consumed the last budgeted agent turn:
+        // no round-robin next agent, so the floor is closed until the owner
+        // speaks. Broadcast Closed so a queued sibling stops waiting instead
+        // of burning its full acquire timeout (Follow-up (a)). This and a
+        // reclaim-Clear are mutually exclusive: a reclaim empties the holder,
+        // so the author's own publish can only be `Published` when no reclaim
+        // happened this call.
+        IngestFloorAction::Published(NextGrant::None) => GrantBroadcast::Closed(lease.revision()),
         _ if reclaimed.is_some() => GrantBroadcast::Clear(lease.revision()),
         _ => GrantBroadcast::None,
     };
@@ -817,6 +835,37 @@ mod tests {
                 assert_eq!(revision, f.revision());
             }
             other => panic!("expected a Clear broadcast, got {other:?}"),
+        }
+        assert!(f.current_holder().is_none());
+    }
+
+    #[test]
+    fn evaluate_floor_publish_closes_when_the_publish_exhausts_the_budget() {
+        // gabe holds the floor and publishes the last turn the owner-turn
+        // budget (1) allows. on_publish returns NextGrant::None, so there is
+        // no next agent to hand off to and the round is now closed until the
+        // owner speaks. This must broadcast Closed (Follow-up (a)) — not
+        // silence, which would leave a queued sibling waiting out its full
+        // acquire timeout.
+        let members = roster(&[owner_role(), member_role(gabe()), member_role(stacy())]);
+        let agents = [gabe(), stacy()];
+        let mut f = FloorLease::new(vec![gabe(), stacy()], Duration::from_secs(30), 1);
+        assert_eq!(f.request(&gabe(), t0()), FloorDecision::Granted);
+        let rev_before = f.revision();
+
+        let (action, broadcast) =
+            evaluate_floor_publish(ChannelType::Stream, &members, &agents, &gabe(), &mut f, t0());
+
+        assert_eq!(action, IngestFloorAction::Published(NextGrant::None));
+        match broadcast {
+            GrantBroadcast::Closed(revision) => {
+                // Budget exhaustion does not bump the revision (see
+                // revision_does_not_bump_while_queued_or_budget_denied), so
+                // the closed broadcast carries the current value unchanged.
+                assert_eq!(revision, rev_before);
+                assert_eq!(revision, f.revision());
+            }
+            other => panic!("expected a Closed broadcast, got {other:?}"),
         }
         assert!(f.current_holder().is_none());
     }

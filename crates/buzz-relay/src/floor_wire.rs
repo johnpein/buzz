@@ -75,6 +75,26 @@ pub fn floor_grant_event(
     revision: u64,
     ttl: Duration,
 ) -> Result<Event, nostr::event::builder::Error> {
+    // `granted` names a holder (`p` tag); `open` clears the floor for
+    // requests. The "closed" state is a sibling variant, see
+    // [`floor_closed_event`].
+    let status = if holder.is_some() { "granted" } else { "open" };
+    build_floor_event(relay_keys, channel_id, holder, status, revision, ttl)
+}
+
+/// Shared builder for every relay-signed `kind:39007` overlay: the uniform
+/// `d`/`h`/`rev`/`expiration` tag set, an optional `p` holder tag, and an
+/// explicit `status` marker. The three public variants — `granted`, `open`
+/// ([`floor_grant_event`]) and `closed` ([`floor_closed_event`]) — differ
+/// only in `holder`/`status`, so the tag construction lives here once.
+fn build_floor_event(
+    relay_keys: &nostr::Keys,
+    channel_id: Uuid,
+    holder: Option<&PubkeyHex>,
+    status: &str,
+    revision: u64,
+    ttl: Duration,
+) -> Result<Event, nostr::event::builder::Error> {
     let channel_hex = channel_id.to_string();
     let expiry = nostr::Timestamp::now() + ttl.as_secs();
     let mut tags = vec![
@@ -84,18 +104,50 @@ pub fn floor_grant_event(
         Tag::parse(["expiration", &expiry.as_secs().to_string()])
             .expect("timestamp is a valid tag value"),
     ];
-    match holder {
-        Some(holder) => {
-            tags.push(Tag::parse(["p", holder.as_str()]).expect("hex pubkey is a valid tag value"));
-            tags.push(Tag::parse(["status", "granted"]).expect("status is a valid tag value"));
-        }
-        None => {
-            tags.push(Tag::parse(["status", "open"]).expect("status is a valid tag value"));
-        }
+    if let Some(holder) = holder {
+        tags.push(Tag::parse(["p", holder.as_str()]).expect("hex pubkey is a valid tag value"));
     }
+    tags.push(Tag::parse(["status", status]).expect("status is a valid tag value"));
     EventBuilder::new(Kind::Custom(KIND_FLOOR_GRANT as u16), "")
         .tags(tags)
         .sign_with_keys(relay_keys)
+}
+
+/// Build the relay-signed `kind:39007` "floor closed" event for `channel_id`.
+///
+/// Emitted when the channel's per-owner-turn agent budget is exhausted (see
+/// [`crate::floor::FloorDecision::DeniedBudgetExhausted`] and
+/// [`crate::floor::GrantBroadcast::Closed`]): no agent may take the floor
+/// again until the owner speaks. It is the explicit wire counterpart to what
+/// used to be silence — a waiting [`buzz-acp` floor client] resolves any
+/// `kind:39007` for its channel that does not name it as holder to "not my
+/// turn, stay quiet" *immediately*, instead of waiting out its acquire
+/// timeout (Follow-up (a), 2026-09-18).
+///
+/// Shape mirrors the `open` variant of [`floor_grant_event`] — no `p` tag,
+/// uniform `d`/`h`/`rev`/`expiration` — but carries `status="closed"` rather
+/// than `"open"`. The distinction matters for correctness of any future
+/// consumer: `"open"` means the floor is *free to request*, whereas
+/// `"closed"` means requesting is futile until the owner reopens it, so the
+/// two must never be conflated on the wire.
+///
+/// `revision` is the lease's current [`crate::floor::FloorLease::revision`],
+/// carried unchanged: budget exhaustion is not a fresh holder transition and
+/// deliberately does not bump the revision (see
+/// `crate::floor::FloorLease`'s `revision_does_not_bump_while_queued_or_budget_denied`
+/// contract), and the sole live consumer resolves on holder identity, not
+/// `rev`.
+///
+/// # Errors
+///
+/// Returns the underlying [`nostr::event::builder::Error`] if signing fails.
+pub fn floor_closed_event(
+    relay_keys: &nostr::Keys,
+    channel_id: Uuid,
+    revision: u64,
+    ttl: Duration,
+) -> Result<Event, nostr::event::builder::Error> {
+    build_floor_event(relay_keys, channel_id, None, "closed", revision, ttl)
 }
 
 /// Build a signed `kind:20003` floor-request event for `channel_id`, scoped
@@ -181,6 +233,28 @@ mod tests {
         assert_eq!(tag_value(&event, "p"), None, "cleared grant must carry no holder");
         assert_eq!(tag_value(&event, "status"), Some("open".to_string()));
         assert_eq!(tag_value(&event, "rev"), Some("4".to_string()));
+        assert!(tag_value(&event, "expiration").is_some());
+    }
+
+    // --- Follow-up (a): the "floor closed / budget exhausted" variant ---
+
+    #[test]
+    fn floor_closed_event_has_no_p_tag_and_status_closed() {
+        let relay = nostr::Keys::generate();
+        let event = floor_closed_event(&relay, channel(), 5, Duration::from_secs(30))
+            .expect("signs");
+
+        assert_eq!(event.kind.as_u16() as u32, KIND_FLOOR_GRANT);
+        assert_eq!(event.pubkey, relay.public_key());
+        assert_eq!(tag_value(&event, "d"), Some(channel().to_string()));
+        assert_eq!(tag_value(&event, "h"), Some(channel().to_string()));
+        assert_eq!(tag_value(&event, "p"), None, "a closed floor names no holder");
+        assert_eq!(
+            tag_value(&event, "status"),
+            Some("closed".to_string()),
+            "budget-exhausted close must be status=closed, never conflated with open"
+        );
+        assert_eq!(tag_value(&event, "rev"), Some("5".to_string()));
         assert!(tag_value(&event, "expiration").is_some());
     }
 

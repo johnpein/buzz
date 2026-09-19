@@ -2257,6 +2257,19 @@ async fn enforce_floor_lease(
                 crate::floor::DEFAULT_FLOOR_TTL,
             );
         }
+        crate::floor::GrantBroadcast::Closed(revision) => {
+            // The publish consumed the last budgeted agent turn: fan out an
+            // explicit "floor closed" so any agent queued behind it stops
+            // waiting immediately instead of burning its acquire timeout
+            // (Follow-up (a)).
+            crate::handlers::floor_glue::emit_floor_closed(
+                tenant,
+                state,
+                channel_id,
+                *revision,
+                crate::floor::DEFAULT_FLOOR_TTL,
+            );
+        }
         crate::floor::GrantBroadcast::None => {}
     }
 

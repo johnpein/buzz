@@ -164,8 +164,11 @@ pub(crate) async fn resolve_floor_lease(
 /// (`FloorLease::reclaim_if_expired`, same "reclaim before deciding"
 /// discipline as `evaluate_floor_at_ingest`), then request the floor on the
 /// requester's behalf. A `Granted` decision fans out a `kind:39007` grant
-/// ([`emit_floor_grant`]); `Queued` and `DeniedBudgetExhausted` emit
-/// nothing, matching the "no grant unless granted" wire rule.
+/// ([`emit_floor_grant`]); `DeniedBudgetExhausted` fans out an explicit
+/// `kind:39007` "closed" signal ([`emit_floor_closed`], Follow-up (a)) so the
+/// requester's floor client stops waiting at once rather than burning its
+/// acquire timeout; only `Queued` still emits nothing (the requester waits
+/// for the current holder's turn to end).
 ///
 /// Returns `Ok(())` in every case except a resolution failure: a
 /// non-floor-enforced channel, a non-agent requester, or an unparseable
@@ -214,15 +217,32 @@ pub(crate) async fn handle_floor_request(
         (decision, guard.revision())
     };
 
-    if matches!(decision, crate::floor::FloorDecision::Granted) {
-        emit_floor_grant(
-            tenant,
-            state,
-            channel_id,
-            Some(&requester_hex),
-            revision,
-            crate::floor::DEFAULT_FLOOR_TTL,
-        );
+    match decision {
+        crate::floor::FloorDecision::Granted => {
+            emit_floor_grant(
+                tenant,
+                state,
+                channel_id,
+                Some(&requester_hex),
+                revision,
+                crate::floor::DEFAULT_FLOOR_TTL,
+            );
+        }
+        crate::floor::FloorDecision::DeniedBudgetExhausted => {
+            // Explicit "closed" so the requester's floor client stops waiting
+            // immediately instead of burning its acquire timeout (Follow-up (a)).
+            emit_floor_closed(
+                tenant,
+                state,
+                channel_id,
+                revision,
+                crate::floor::DEFAULT_FLOOR_TTL,
+            );
+        }
+        // Queued: the requester waits for the current holder's turn to end;
+        // it will be granted (or closed) by the holder's publish, so no
+        // separate signal is emitted here.
+        crate::floor::FloorDecision::Queued => {}
     }
 
     Ok(())
@@ -257,20 +277,55 @@ pub fn emit_floor_grant(
     revision: u64,
     ttl: Duration,
 ) {
+    let holder = holder.cloned();
+    spawn_emit_floor_event(tenant, state, channel_id, "grant", move |keys| {
+        crate::floor_wire::floor_grant_event(keys, channel_id, holder.as_ref(), revision, ttl)
+    });
+}
+
+/// Sign and fan out a relay-signed `kind:39007` "floor closed" overlay for
+/// `channel_id` — the explicit budget-exhausted signal (see
+/// [`crate::floor_wire::floor_closed_event`] and
+/// [`crate::floor::GrantBroadcast::Closed`]) emitted when a `kind:20003`
+/// request is denied for budget ([`handle_floor_request`]) or a publish
+/// consumes the last budgeted turn (`handlers::ingest::enforce_floor_lease`).
+/// A waiting agent's floor client resolves it immediately instead of burning
+/// its acquire timeout (Follow-up (a)). Same fan-out-only, never-stored
+/// discipline as [`emit_floor_grant`].
+pub fn emit_floor_closed(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    channel_id: Uuid,
+    revision: u64,
+    ttl: Duration,
+) {
+    spawn_emit_floor_event(tenant, state, channel_id, "closed", move |keys| {
+        crate::floor_wire::floor_closed_event(keys, channel_id, revision, ttl)
+    });
+}
+
+/// Shared spawn+sign+fan-out body for every `kind:39007` overlay
+/// ([`emit_floor_grant`], [`emit_floor_closed`]): sign with the relay keypair
+/// off the triggering request/publish's own accept path, publish to Redis
+/// before the local fan-out so subscribers on other relay pods receive it
+/// too, and never store the event. `kind_label` names the variant in log
+/// lines; `build` turns the relay keypair into the signed event.
+fn spawn_emit_floor_event<F>(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    channel_id: Uuid,
+    kind_label: &'static str,
+    build: F,
+) where
+    F: FnOnce(&nostr::Keys) -> Result<nostr::Event, nostr::event::builder::Error> + Send + 'static,
+{
     let tenant = tenant.clone();
     let state = Arc::clone(state);
-    let holder = holder.cloned();
     tokio::spawn(async move {
-        let event = match crate::floor_wire::floor_grant_event(
-            &state.relay_keypair,
-            channel_id,
-            holder.as_ref(),
-            revision,
-            ttl,
-        ) {
+        let event = match build(&state.relay_keypair) {
             Ok(event) => event,
             Err(e) => {
-                warn!(channel_id = %channel_id, "floor grant sign failed: {e}");
+                warn!(channel_id = %channel_id, "floor {kind_label} sign failed: {e}");
                 return;
             }
         };
@@ -286,7 +341,7 @@ pub fn emit_floor_grant(
             state
                 .local_event_ids
                 .invalidate(&(tenant.community(), event.id.to_bytes()));
-            warn!(channel_id = %channel_id, "floor grant Redis publish failed: {e}");
+            warn!(channel_id = %channel_id, "floor {kind_label} Redis publish failed: {e}");
         }
         let stored = StoredEvent::new(event, Some(channel_id));
         crate::handlers::event::fan_out_event_to_local_subscribers(

@@ -90,7 +90,7 @@ use uuid::Uuid;
 use buzz_core::tenant::CommunityId;
 use buzz_core::StoredEvent;
 use buzz_relay::floor::{FloorDecision, FloorLease, NextGrant};
-use buzz_relay::floor_wire::floor_grant_event;
+use buzz_relay::floor_wire::{floor_closed_event, floor_grant_event};
 use buzz_relay::subscription::SubscriptionRegistry;
 use buzz_sdk::broker::PubkeyHex;
 
@@ -384,4 +384,75 @@ fn cleared_grant_revision_strictly_exceeds_the_grant_it_supersedes() {
     );
     assert_eq!(status_tag(&granted_event), Some("granted".to_string()));
     assert_eq!(status_tag(&cleared_event), Some("open".to_string()));
+}
+
+// --- Follow-up (a): the "floor closed / budget exhausted" grant, wire-level ---
+
+/// Build+fan-out the budget-exhausted "closed" grant at `revision`, returning
+/// the `fan_out_scoped` match list. Mirrors `handlers::floor_glue`'s new
+/// `emit_floor_closed` glue minus the production keypair and Redis/WS I/O,
+/// exactly as [`build_and_fan_out_grant`] mirrors `emit_floor_grant`.
+fn build_and_fan_out_closed(
+    registry: &SubscriptionRegistry,
+    community: CommunityId,
+    channel_id: Uuid,
+    revision: u64,
+) -> Vec<(Uuid, String)> {
+    let relay_keys = nostr::Keys::generate();
+    let event = floor_closed_event(&relay_keys, channel_id, revision, Duration::from_secs(30))
+        .expect("closed event signs");
+    let stored = StoredEvent::new(event, Some(channel_id));
+    registry.fan_out_scoped(community, &stored)
+}
+
+#[test]
+fn closed_grant_is_delivered_to_the_channel_subscriber_on_budget_exhaustion() {
+    // Mirrors evaluate_floor_publish's Closed path (see floor.rs's own tests
+    // for the pure decision): gabe holds the floor and publishes the last
+    // turn a budget of 1 allows, so on_publish yields NextGrant::None and the
+    // round is closed. The wire glue must fan out a `kind:39007` so a waiting
+    // subscriber learns the floor is closed and stops waiting immediately,
+    // instead of the pre-Follow-up-(a) silence that stranded it for the full
+    // acquire timeout.
+    let community = CommunityId::from_uuid(Uuid::new_v4());
+    let channel_id = Uuid::new_v4();
+    let registry = SubscriptionRegistry::new();
+    subscribe_to_channel_grants(&registry, community, channel_id);
+
+    let gabe = pubkey();
+    let mut lease = FloorLease::new(vec![gabe.clone()], Duration::from_secs(30), 1);
+    let now = Instant::now();
+
+    assert_eq!(lease.request(&gabe, now), FloorDecision::Granted);
+    assert_eq!(
+        lease.on_publish(&gabe, now).expect("gabe holds the floor"),
+        NextGrant::None,
+        "a budget of 1 is exhausted by the first publish"
+    );
+
+    let matches = build_and_fan_out_closed(&registry, community, channel_id, lease.revision());
+    assert_eq!(
+        matches.len(),
+        1,
+        "the closed grant must still reach the one channel subscriber"
+    );
+}
+
+#[test]
+fn closed_grant_carries_status_closed_and_no_holder() {
+    let relay_keys = nostr::Keys::generate();
+    let channel_id = Uuid::new_v4();
+    let event = floor_closed_event(&relay_keys, channel_id, 7, Duration::from_secs(30))
+        .expect("signs");
+
+    let tag = |name: &str| -> Option<String> {
+        event
+            .tags
+            .iter()
+            .find(|t| t.as_slice().first().map(String::as_str) == Some(name))
+            .and_then(|t| t.as_slice().get(1).cloned())
+    };
+    assert_eq!(tag("status"), Some("closed".to_string()));
+    assert_eq!(tag("p"), None, "a closed floor names no holder");
+    assert_eq!(tag("h"), Some(channel_id.to_string()));
 }
