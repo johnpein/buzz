@@ -20,7 +20,7 @@ pub struct DurableReplyRequest<'a> {
     pub keys: &'a Keys,
     /// Verified NIP-OA owner authorization tag JSON.
     pub auth_tag: &'a str,
-    /// Exact DM channel UUID.
+    /// Exact DM or stream channel UUID.
     pub channel: &'a str,
     /// UTF-8 reply text.
     pub content: &'a str,
@@ -155,11 +155,16 @@ pub async fn prepare_and_publish_reply(
 fn durable_reply_error(failure: prepared_event::PreparedFailure) -> DurableReplyError {
     let output = failure.output();
     let value = output.stderr.unwrap_or_else(|| serde_json::json!({}));
+    let class = value["error"].as_str().unwrap_or("durable_reply_failed");
+    // Carry the specific cause (`message` for user errors, `reason` for manual
+    // review) — the class alone ("user_error") is undiagnosable. Neither field
+    // ever holds reply content.
+    let detail = value["message"].as_str().or(value["reason"].as_str());
     DurableReplyError {
-        message: value["error"]
-            .as_str()
-            .unwrap_or("durable_reply_failed")
-            .to_string(),
+        message: match detail {
+            Some(detail) => format!("{class}: {detail}"),
+            None => class.to_string(),
+        },
         retryable: value["retryable"].as_bool().unwrap_or(false),
     }
 }

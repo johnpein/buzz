@@ -301,8 +301,25 @@ struct Fixture {
     agent_secret: String,
 }
 
+/// Which channel the fake relay serves.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChannelShape {
+    /// The owner/agent DM pair, both `member`.
+    Dm,
+    /// A `stream` group: owner, the replying agent (`bot`) and a sibling agent.
+    Stream,
+    /// A `stream` group the replying agent is not seated in.
+    StreamWithoutAgent,
+    /// A channel type the prepared path does not serve.
+    Forum,
+}
+
 impl Fixture {
     async fn start() -> Self {
+        Self::start_with(ChannelShape::Dm).await
+    }
+
+    async fn start_with(shape: ChannelShape) -> Self {
         let channel = "216209f0-1896-4d63-9e06-4411951562ec";
         let owner = Keys::parse("0202020202020202020202020202020202020202020202020202020202020202")
             .expect("owner keys");
@@ -321,22 +338,46 @@ impl Fixture {
             vec![
                 Tag::parse(["d", channel]).expect("d tag"),
                 Tag::parse(["private"]).expect("private tag"),
-                Tag::parse(["hidden"]).expect("hidden tag"),
                 Tag::parse(["closed"]).expect("closed tag"),
-                Tag::parse(["t", "dm"]).expect("type tag"),
-                Tag::parse(["p", &owner_hex]).expect("owner participant"),
-                Tag::parse(["p", &agent_hex]).expect("agent participant"),
-            ],
+            ]
+            .into_iter()
+            .chain(match shape {
+                ChannelShape::Dm => vec![
+                    Tag::parse(["hidden"]).expect("hidden tag"),
+                    Tag::parse(["t", "dm"]).expect("type tag"),
+                    Tag::parse(["p", &owner_hex]).expect("owner participant"),
+                    Tag::parse(["p", &agent_hex]).expect("agent participant"),
+                ],
+                ChannelShape::Stream | ChannelShape::StreamWithoutAgent => {
+                    vec![Tag::parse(["t", "stream"]).expect("type tag")]
+                }
+                ChannelShape::Forum => vec![Tag::parse(["t", "forum"]).expect("type tag")],
+            })
+            .collect(),
         );
+        let sibling_hex = Keys::generate().public_key().to_hex();
         let members = signed_event(
             &relay,
             39002,
             "",
-            vec![
-                Tag::parse(["d", channel]).expect("d tag"),
-                Tag::parse(["p", &owner_hex, "", "member"]).expect("owner participant"),
-                Tag::parse(["p", &agent_hex, "", "member"]).expect("agent membership"),
-            ],
+            vec![Tag::parse(["d", channel]).expect("d tag")]
+                .into_iter()
+                .chain(match shape {
+                    ChannelShape::Dm => vec![
+                        Tag::parse(["p", &owner_hex, "", "member"]).expect("owner participant"),
+                        Tag::parse(["p", &agent_hex, "", "member"]).expect("agent membership"),
+                    ],
+                    ChannelShape::Stream | ChannelShape::Forum => vec![
+                        Tag::parse(["p", &owner_hex, "", "owner"]).expect("owner membership"),
+                        Tag::parse(["p", &agent_hex, "", "bot"]).expect("agent membership"),
+                        Tag::parse(["p", &sibling_hex, "", "bot"]).expect("sibling membership"),
+                    ],
+                    ChannelShape::StreamWithoutAgent => vec![
+                        Tag::parse(["p", &owner_hex, "", "owner"]).expect("owner membership"),
+                        Tag::parse(["p", &sibling_hex, "", "bot"]).expect("sibling membership"),
+                    ],
+                })
+                .collect(),
         );
         let parent = signed_event(
             &owner,
@@ -1165,6 +1206,93 @@ async fn startup_replay_reconciles_canonical_records_ignores_only_exact_staging_
     .await
     .expect_err("manual-review marker must block startup replay");
     assert!(!blocked.retryable());
+
+    fixture.server.abort();
+}
+
+#[tokio::test]
+async fn stream_group_reply_prepares_and_publishes_for_a_seated_agent() {
+    let fixture = Fixture::start_with(ChannelShape::Stream).await;
+    fixture.set_publish_mode(PublishMode::Accept);
+
+    let args = fixture.prepare_args(&"77".repeat(32), &fixture.parent_id.clone());
+    let (prepare, _stdout, stderr) = run_cli(&args, b"group reply").await;
+    assert_eq!(
+        prepare,
+        0,
+        "a stream channel seating the owner and the agent must prepare: {}",
+        String::from_utf8_lossy(&stderr),
+    );
+    let prepared: Value =
+        serde_json::from_slice(&std::fs::read(&fixture.record).expect("prepared record"))
+            .expect("prepared record JSON");
+    assert_eq!(prepared["channel"]["channelType"], json!("stream"));
+    assert_eq!(
+        prepared["channel"]["members"]
+            .as_array()
+            .expect("members")
+            .len(),
+        3,
+        "the full owner-controlled roster is frozen into the record",
+    );
+    assert_eq!(prepared["mentions"], json!([]));
+
+    let (publish, stdout, stderr) = run_cli(&fixture.publish_args(), b"").await;
+    assert_eq!(
+        publish,
+        0,
+        "the prepared stream reply must publish: {}",
+        String::from_utf8_lossy(&stderr),
+    );
+    let receipt: Value = serde_json::from_slice(&stdout).expect("publish JSON stdout");
+    assert_eq!(receipt["accepted"], json!(true));
+    assert_eq!(
+        fixture
+            .state
+            .publish_bodies
+            .lock()
+            .expect("publish-body lock")
+            .len(),
+        1,
+    );
+
+    fixture.server.abort();
+}
+
+#[tokio::test]
+async fn stream_group_reply_fails_closed_when_the_agent_is_not_seated() {
+    let fixture = Fixture::start_with(ChannelShape::StreamWithoutAgent).await;
+
+    let args = fixture.prepare_args(&"88".repeat(32), &fixture.parent_id.clone());
+    let (code, _stdout, stderr) = run_cli(&args, b"group reply").await;
+    assert_eq!(code, 1);
+    let error: Value = serde_json::from_slice(&stderr).expect("error JSON stderr");
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("stream channel membership does not admit")),
+        "an unseated agent must be refused by name: {error}",
+    );
+    assert!(!fixture.record.exists());
+
+    fixture.server.abort();
+}
+
+#[tokio::test]
+async fn unsupported_channel_type_fails_closed() {
+    let fixture = Fixture::start_with(ChannelShape::Forum).await;
+
+    let args = fixture.prepare_args(&"99".repeat(32), &fixture.parent_id.clone());
+    let (code, _stdout, stderr) = run_cli(&args, b"forum reply").await;
+    assert_eq!(code, 1);
+    let error: Value = serde_json::from_slice(&stderr).expect("error JSON stderr");
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("require a DM or stream channel")),
+        "only dm and stream are served: {error}",
+    );
+    assert!(!fixture.record.exists());
 
     fixture.server.abort();
 }

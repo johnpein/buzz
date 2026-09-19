@@ -2941,7 +2941,7 @@ pub async fn run_prompt_task(
                                 Some(result) => {
                                     verify_and_publish_trusted_reply(&ctx, prompt, result).await
                                 }
-                                None => Err(TrustedReplyFailure::Terminal),
+                                None => Err(missing_trusted_prompt_result()),
                             };
                             if let Err(failure) = publish_result {
                                 agent.state.invalidate(&source);
@@ -3006,7 +3006,7 @@ pub async fn run_prompt_task(
         if let Some(prompt) = verified_prompt_params.as_ref() {
             let publish_result = match agent.acp.take_prompt_result() {
                 Some(result) => verify_and_publish_trusted_reply(&ctx, prompt, result).await,
-                None => Err(TrustedReplyFailure::Terminal),
+                None => Err(missing_trusted_prompt_result()),
             };
             if let Err(failure) = publish_result {
                 agent.state.invalidate(&source);
@@ -3701,17 +3701,31 @@ async fn verify_and_publish_trusted_reply(
     prompt: &VerifiedTrustedPrompt,
     result: serde_json::Value,
 ) -> Result<(), TrustedReplyFailure> {
+    // Loud-failure discipline: every exit names its stage and cause. None of
+    // these causes carries reply text or key material.
+    let terminal = |stage: &'static str, cause: &dyn std::fmt::Display| {
+        tracing::error!(
+            channel_id = %prompt.turn.channel,
+            delivery_id = %prompt.turn.delivery_id,
+            stage,
+            "trusted reply publish failed: {cause}"
+        );
+        TrustedReplyFailure::Terminal
+    };
     let publish = ctx
         .trusted_publish
         .as_ref()
-        .ok_or(TrustedReplyFailure::Terminal)?;
+        .ok_or_else(|| terminal("capability", &"trusted Buzz capability is unavailable"))?;
     let current_deployment = crate::config::revalidate_trusted_publish_runtime(publish.harness)
-        .map_err(|_| TrustedReplyFailure::Terminal)?;
+        .map_err(|error| terminal("runtime_revalidation", &error))?;
     if current_deployment != prompt.deployment_fingerprint {
-        return Err(TrustedReplyFailure::Terminal);
+        return Err(terminal(
+            "deployment_fingerprint",
+            &"deployment changed during the turn",
+        ));
     }
     let reply = crate::trusted_transport::verify_response(&prompt.turn, &result)
-        .map_err(|_| TrustedReplyFailure::Terminal)?;
+        .map_err(|error| terminal("response_proof", &format!("{error:#}")))?;
     let out = publish
         .outbox_dir
         .join(format!("buzz-outbox-{}.json", prompt.turn.delivery_id));
@@ -3724,18 +3738,28 @@ async fn verify_and_publish_trusted_reply(
         reply_to: &prompt.turn.reply_to,
         thread_root: &prompt.turn.thread_root,
         execution_id: &prompt.turn.delivery_id,
-        mentions: std::slice::from_ref(&prompt.turn.owner_pubkey),
+        mentions: &prompt.turn.mentions,
         out: &out,
     })
     .await
     .map_err(|error| {
         if error.retryable() {
+            tracing::warn!(
+                channel_id = %prompt.turn.channel,
+                delivery_id = %prompt.turn.delivery_id,
+                "trusted reply publish will retry: {error}"
+            );
             TrustedReplyFailure::Retryable
         } else {
-            TrustedReplyFailure::Terminal
+            terminal("durable_publish", &error)
         }
     })?;
     Ok(())
+}
+
+fn missing_trusted_prompt_result() -> TrustedReplyFailure {
+    tracing::error!("trusted reply publish failed: the completed turn carried no prompt result");
+    TrustedReplyFailure::Terminal
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

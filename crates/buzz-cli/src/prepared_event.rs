@@ -755,11 +755,20 @@ async fn fetch_snapshot(client: &BuzzClient, channel: Uuid) -> Result<Snapshot, 
             && values.get(1).map(String::as_str) == Some("dm"))
             || values.first().map(String::as_str) == Some("hidden")
     });
-    if !is_dm {
+    let is_stream = metadata.tags.iter().any(|tag| {
+        let values = tag.as_slice();
+        values.first().map(String::as_str) == Some("t")
+            && values.get(1).map(String::as_str) == Some("stream")
+    });
+    let channel_type = if is_dm {
+        "dm"
+    } else if is_stream {
+        "stream"
+    } else {
         return Err(PreparedFailure::User(
-            "prepared P0 replies require a DM channel".into(),
+            "prepared P0 replies require a DM or stream channel".into(),
         ));
-    }
+    };
     let agent_pubkey = client.keys().public_key().to_hex().to_ascii_lowercase();
     let owner_pubkey = client
         .auth_tag_owner_hex()
@@ -781,17 +790,10 @@ async fn fetch_snapshot(client: &BuzzClient, channel: Uuid) -> Result<Snapshot, 
         })
         .collect::<Vec<_>>();
     members.sort_by(|left, right| left.pubkey.as_bytes().cmp(right.pubkey.as_bytes()));
-    if members.len() != 2
-        || !members
-            .iter()
-            .any(|member| member.pubkey == owner_pubkey && member.role == "member")
-        || !members
-            .iter()
-            .any(|member| member.pubkey == agent_pubkey && member.role == "member")
-    {
-        return Err(PreparedFailure::User(
-            "current channel membership is not the exact owner/agent DM set".into(),
-        ));
+    if !membership_admits_reply(channel_type, &members, &owner_pubkey, &agent_pubkey) {
+        return Err(PreparedFailure::User(format!(
+            "current {channel_type} channel membership does not admit an owner-authorized agent reply"
+        )));
     }
     let channel_text = channel.to_string();
     let revision = membership_revision(&channel_text, &members)?;
@@ -805,7 +807,7 @@ async fn fetch_snapshot(client: &BuzzClient, channel: Uuid) -> Result<Snapshot, 
     Ok(Snapshot {
         channel: ChannelClaim {
             id: channel_text,
-            channel_type: "dm".into(),
+            channel_type: channel_type.into(),
             owner_pubkey: owner_pubkey.clone(),
             agent_pubkey: agent_pubkey.clone(),
             members,
@@ -981,14 +983,12 @@ fn validate_record(client: &BuzzClient, record: &PreparedRecord) -> Result<(), P
         &event.content,
         &record.mentions,
     )?;
-    let exact_members =
-        record.channel.members.len() == 2
-            && record.channel.members.iter().any(|member| {
-                member.pubkey == record.channel.owner_pubkey && member.role == "member"
-            })
-            && record.channel.members.iter().any(|member| {
-                member.pubkey == record.channel.agent_pubkey && member.role == "member"
-            });
+    let members_admit_reply = membership_admits_reply(
+        &record.channel.channel_type,
+        &record.channel.members,
+        &record.channel.owner_pubkey,
+        &record.channel.agent_pubkey,
+    );
     if !tag_equals("h", &record.channel.id)
         || !tag_equals(
             "buzz_membership_revision",
@@ -997,8 +997,7 @@ fn validate_record(client: &BuzzClient, record: &PreparedRecord) -> Result<(), P
         || !thread_tags_valid
         || event_mentions != claimed_mentions
         || fingerprint != record.fingerprint
-        || record.channel.channel_type != "dm"
-        || !exact_members
+        || !members_admit_reply
         || record.channel.owner_pubkey != record.auth.owner_pubkey
         || record.channel.agent_pubkey != record.auth.agent_pubkey
         || client.keys().public_key().to_hex().to_ascii_lowercase() != record.auth.agent_pubkey
@@ -1016,6 +1015,34 @@ fn validate_record(client: &BuzzClient, record: &PreparedRecord) -> Result<(), P
         ));
     }
     Ok(())
+}
+
+/// Whether the authoritative roster lets this owner-authorized agent reply.
+///
+/// `dm` keeps the exact owner/agent pair, both `member`. `stream` is a group
+/// the owner controls: the owner and the replying agent must both be seated,
+/// other members and their roles (e.g. a sibling agent's `bot`) are the
+/// owner's business. Any other channel type is refused.
+fn membership_admits_reply(
+    channel_type: &str,
+    members: &[MemberClaim],
+    owner_pubkey: &str,
+    agent_pubkey: &str,
+) -> bool {
+    let seated = |pubkey: &str, role: Option<&str>| {
+        members
+            .iter()
+            .any(|member| member.pubkey == pubkey && role.is_none_or(|role| member.role == role))
+    };
+    match channel_type {
+        "dm" => {
+            members.len() == 2
+                && seated(owner_pubkey, Some("member"))
+                && seated(agent_pubkey, Some("member"))
+        }
+        "stream" => seated(owner_pubkey, None) && seated(agent_pubkey, None),
+        _ => false,
+    }
 }
 
 fn normalize_mentions(mentions: &[String]) -> Result<Vec<String>, PreparedFailure> {

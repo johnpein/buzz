@@ -21,7 +21,10 @@ pub(crate) struct TrustedTurn {
     pub channel: String,
     pub reply_to: String,
     pub thread_root: String,
-    pub owner_pubkey: String,
+    /// Pubkeys the reply `p`-tags: the owner in a `dm`; nobody in a `stream`,
+    /// where a mention would page the owner on every agent turn and, under
+    /// mention-gated delivery, could chain sibling agents into a reply loop.
+    pub mentions: Vec<String>,
     nonce: String,
 }
 
@@ -52,6 +55,10 @@ pub(crate) fn attach_request(params: &mut Value, key: [u8; 32], now: i64) -> Res
     let reply_to = required_string_at(&envelope, "/reply/replyToEventId")?;
     let thread_root = required_string_at(&envelope, "/reply/rootEventId")?;
     let owner_pubkey = required_string_at(&envelope, "/channel/ownerPubkey")?;
+    let mentions = match required_string_at(&envelope, "/channel/type")?.as_str() {
+        "stream" => Vec::new(),
+        _ => vec![owner_pubkey],
+    };
     let envelope_hash = hex::encode(Sha256::digest(
         crate::buzz_envelope::canonical_json(&envelope)?.as_bytes(),
     ));
@@ -83,7 +90,7 @@ pub(crate) fn attach_request(params: &mut Value, key: [u8; 32], now: i64) -> Res
         channel,
         reply_to,
         thread_root,
-        owner_pubkey,
+        mentions,
         nonce,
     })
 }
@@ -190,7 +197,7 @@ mod tests {
             "_meta": {"buzz": {
                 "version": 1,
                 "deliveryId": "11".repeat(32),
-                "channel": {"id": "631bce80-fe26-436c-98ee-2c28e9360ec4", "ownerPubkey": "22".repeat(32)},
+                "channel": {"id": "631bce80-fe26-436c-98ee-2c28e9360ec4", "type": "dm", "ownerPubkey": "22".repeat(32)},
                 "reply": {"replyToEventId": "33".repeat(32), "rootEventId": "44".repeat(32)},
                 "events": []
             }}
@@ -308,6 +315,18 @@ mod tests {
         let mut response = signed_response(&turn, "hello");
         response["unexpected"] = json!(true);
         assert!(verify_response(&turn, &response).is_err());
+    }
+
+    #[test]
+    fn dm_reply_mentions_the_owner_and_stream_reply_mentions_nobody() {
+        let mut dm = params();
+        let turn = attach_request(&mut dm, [7; 32], 1_700_000_000).unwrap();
+        assert_eq!(turn.mentions, vec!["22".repeat(32)]);
+
+        let mut stream = params();
+        stream["_meta"]["buzz"]["channel"]["type"] = json!("stream");
+        let turn = attach_request(&mut stream, [7; 32], 1_700_000_000).unwrap();
+        assert!(turn.mentions.is_empty());
     }
 
     #[test]
