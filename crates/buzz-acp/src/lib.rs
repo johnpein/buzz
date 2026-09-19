@@ -13,6 +13,7 @@ mod prompt_framing;
 mod prompt_project;
 mod queue;
 mod relay;
+mod reply_mentions;
 mod setup_mode;
 mod trusted_transport;
 mod usage;

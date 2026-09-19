@@ -3726,6 +3726,25 @@ async fn verify_and_publish_trusted_reply(
     }
     let reply = crate::trusted_transport::verify_response(&prompt.turn, &result)
         .map_err(|error| terminal("response_proof", &format!("{error:#}")))?;
+    let mentions = if prompt.turn.roster.is_empty() {
+        prompt.turn.mentions.clone()
+    } else {
+        crate::reply_mentions::resolve(
+            &ctx.rest_client,
+            &prompt.turn.roster,
+            &ctx.agent_keys.public_key().to_hex(),
+            &reply.text,
+        )
+        .await
+        .map_err(|error| {
+            tracing::warn!(
+                channel_id = %prompt.turn.channel,
+                delivery_id = %prompt.turn.delivery_id,
+                "trusted reply publish will retry: {error}"
+            );
+            TrustedReplyFailure::Retryable
+        })?
+    };
     let out = publish
         .outbox_dir
         .join(format!("buzz-outbox-{}.json", prompt.turn.delivery_id));
@@ -3738,7 +3757,7 @@ async fn verify_and_publish_trusted_reply(
         reply_to: &prompt.turn.reply_to,
         thread_root: &prompt.turn.thread_root,
         execution_id: &prompt.turn.delivery_id,
-        mentions: &prompt.turn.mentions,
+        mentions: &mentions,
         out: &out,
     })
     .await

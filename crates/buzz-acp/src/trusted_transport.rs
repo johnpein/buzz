@@ -21,10 +21,11 @@ pub(crate) struct TrustedTurn {
     pub channel: String,
     pub reply_to: String,
     pub thread_root: String,
-    /// Pubkeys the reply `p`-tags: the owner in a `dm`; nobody in a `stream`,
-    /// where a mention would page the owner on every agent turn and, under
-    /// mention-gated delivery, could chain sibling agents into a reply loop.
+    /// Pubkeys a `dm` reply `p`-tags: the owner. Empty for a `stream`, whose
+    /// mentions come from whom the reply text addresses (`reply_mentions`).
     pub mentions: Vec<String>,
+    /// The verified `stream` roster a reply may address. Empty for a `dm`.
+    pub roster: Vec<String>,
     nonce: String,
 }
 
@@ -55,9 +56,9 @@ pub(crate) fn attach_request(params: &mut Value, key: [u8; 32], now: i64) -> Res
     let reply_to = required_string_at(&envelope, "/reply/replyToEventId")?;
     let thread_root = required_string_at(&envelope, "/reply/rootEventId")?;
     let owner_pubkey = required_string_at(&envelope, "/channel/ownerPubkey")?;
-    let mentions = match required_string_at(&envelope, "/channel/type")?.as_str() {
-        "stream" => Vec::new(),
-        _ => vec![owner_pubkey],
+    let (mentions, roster) = match required_string_at(&envelope, "/channel/type")?.as_str() {
+        "stream" => (Vec::new(), roster_pubkeys(&envelope)?),
+        _ => (vec![owner_pubkey], Vec::new()),
     };
     let envelope_hash = hex::encode(Sha256::digest(
         crate::buzz_envelope::canonical_json(&envelope)?.as_bytes(),
@@ -91,6 +92,7 @@ pub(crate) fn attach_request(params: &mut Value, key: [u8; 32], now: i64) -> Res
         reply_to,
         thread_root,
         mentions,
+        roster,
         nonce,
     })
 }
@@ -168,6 +170,16 @@ fn verify_mac(key: &[u8; 32], domain: &[u8], value: &Value, encoded: &str) -> Re
     mac.update(crate::buzz_envelope::canonical_json(value)?.as_bytes());
     mac.verify_slice(&bytes)
         .map_err(|_| anyhow::anyhow!("trusted ACP response MAC is invalid"))
+}
+
+fn roster_pubkeys(envelope: &Value) -> Result<Vec<String>> {
+    envelope
+        .pointer("/channel/members")
+        .and_then(Value::as_array)
+        .context("trusted Buzz field /channel/members is missing")?
+        .iter()
+        .map(|member| required_string(member, "pubkey"))
+        .collect()
 }
 
 fn required_string(value: &Value, field: &str) -> Result<String> {
@@ -318,15 +330,20 @@ mod tests {
     }
 
     #[test]
-    fn dm_reply_mentions_the_owner_and_stream_reply_mentions_nobody() {
+    fn dm_reply_mentions_the_owner_and_stream_reply_carries_its_roster() {
         let mut dm = params();
         let turn = attach_request(&mut dm, [7; 32], 1_700_000_000).unwrap();
         assert_eq!(turn.mentions, vec!["22".repeat(32)]);
 
         let mut stream = params();
         stream["_meta"]["buzz"]["channel"]["type"] = json!("stream");
+        stream["_meta"]["buzz"]["channel"]["members"] = json!([
+            {"pubkey": "22".repeat(32), "role": "owner"},
+            {"pubkey": "55".repeat(32), "role": "bot"},
+        ]);
         let turn = attach_request(&mut stream, [7; 32], 1_700_000_000).unwrap();
         assert!(turn.mentions.is_empty());
+        assert_eq!(turn.roster, vec!["22".repeat(32), "55".repeat(32)]);
     }
 
     #[test]
