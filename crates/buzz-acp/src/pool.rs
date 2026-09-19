@@ -2132,6 +2132,7 @@ pub async fn run_prompt_task(
             let floor_enforced = if crate::floor_client::floor_enforcement_applicable(
                 is_dm,
                 ctx.agent_owner_pubkey.is_some(),
+                crate::floor_client::group_floor_enabled(),
             ) {
                 // `floor_enforcement_applicable` guarantees `agent_owner_pubkey`
                 // is `Some` here.

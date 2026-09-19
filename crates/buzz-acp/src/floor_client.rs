@@ -151,8 +151,33 @@ fn floor_enforced_decision(channel_type: &str, other_agent_present: bool) -> boo
 /// cannot classify any other roster member as a sibling either (see
 /// `crate::is_owner_or_sibling`'s "no owner configured — fail closed"
 /// branch), so that case is also never a candidate.
-pub(crate) fn floor_enforcement_applicable(is_dm: bool, has_owner: bool) -> bool {
-    has_owner && !is_dm
+///
+/// `floor_enabled` is the master switch ([`group_floor_enabled`]): the floor
+/// protocol is OFF by default (Path C, 2026-09-19), because the hosted relay
+/// this client talks to does not run the floor lease — attempting the
+/// request/grant handshake there only makes every group reply wait out its
+/// acquire timeout and stay silent. With the floor disabled the channel is
+/// never a candidate, so `run_prompt_task` publishes group replies directly
+/// (turn ordering falls to the CE-side consecutive-agent-turn budget). It is
+/// turned on only against a relay that implements the floor (e.g. a
+/// self-hosted one), via `BUZZ_GROUP_FLOOR_ENABLED`.
+pub(crate) fn floor_enforcement_applicable(is_dm: bool, has_owner: bool, floor_enabled: bool) -> bool {
+    floor_enabled && has_owner && !is_dm
+}
+
+/// Master switch for the group-chat floor protocol on the client side.
+///
+/// Default OFF (Path C): the client publishes group replies without the
+/// request/grant handshake, so it works against a relay that does not
+/// implement the floor lease (the hosted relay). Set `BUZZ_GROUP_FLOOR_ENABLED`
+/// to `1`/`true`/`yes` to re-enable the handshake against a relay that does
+/// run the floor (e.g. a self-hosted relay). Read once per channel session at
+/// the [`floor_enforcement_applicable`] pre-check, not per turn.
+pub(crate) fn group_floor_enabled() -> bool {
+    matches!(
+        std::env::var("BUZZ_GROUP_FLOOR_ENABLED").ok().as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES")
+    )
 }
 
 /// Resolve whether floor enforcement applies to `channel_id`, from an
@@ -400,17 +425,27 @@ mod tests {
 
     #[test]
     fn dm_channel_is_never_applicable_even_with_a_resolved_owner() {
-        assert!(!floor_enforcement_applicable(true, true));
+        assert!(!floor_enforcement_applicable(true, true, true));
     }
 
     #[test]
-    fn stream_channel_with_a_resolved_owner_is_applicable() {
-        assert!(floor_enforcement_applicable(false, true));
+    fn stream_channel_with_a_resolved_owner_is_applicable_when_floor_enabled() {
+        assert!(floor_enforcement_applicable(false, true, true));
     }
 
     #[test]
     fn stream_channel_with_no_resolved_owner_is_not_applicable() {
-        assert!(!floor_enforcement_applicable(false, false));
+        assert!(!floor_enforcement_applicable(false, false, true));
+    }
+
+    #[test]
+    fn floor_disabled_is_never_applicable_even_for_a_stream_with_owner() {
+        // Path C: the master switch is off, so even the one shape that would
+        // otherwise enforce the floor (stream + resolved owner + a sibling)
+        // is not a candidate — the client skips the handshake and publishes
+        // directly, instead of waiting out its acquire timeout against a
+        // relay that never grants.
+        assert!(!floor_enforcement_applicable(false, true, false));
     }
 
     // --- acquire_floor (async control flow, no live relay) ---
