@@ -72,11 +72,14 @@ pub fn build_verified_buzz_prompt_params(input: VerifiedBuzzPromptInput<'_>) -> 
         .iter()
         .map(|(pubkey, role)| {
             let pubkey = normalize_pubkey(pubkey)?;
-            // `agent` is the role Buzz assigns co-located agent members of a
-            // group/stream channel (see buzz-relay api: `("agent", agent)`);
-            // rejecting it refused the very sibling agents group chat exists
-            // for. Name the offending role so an unexpected one is diagnosable.
-            if !matches!(role.as_str(), "owner" | "admin" | "member" | "agent") {
+            // Buzz assigns co-located agent members a bot/agent role in a
+            // group channel: the hosted (production) relay uses `bot` (live
+            // 2026-09-19), the local relay api uses `agent` (`("agent", agent)`)
+            // — accept both so admission works against either. Rejecting them
+            // refused the very sibling agents group chat exists for; only
+            // `guest` (and anything unknown) stays rejected. Name the role so
+            // an unexpected one is diagnosable.
+            if !matches!(role.as_str(), "owner" | "admin" | "member" | "agent" | "bot") {
                 bail!("unsupported Buzz membership role: {role}");
             }
             Ok(json!({"pubkey": pubkey, "role": role}))

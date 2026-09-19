@@ -1120,10 +1120,10 @@ fn stream_channel_three_members_sibling_authored_is_accepted() {
 }
 
 #[test]
-fn stream_roster_with_bot_or_guest_role_is_rejected() {
+fn stream_roster_with_guest_role_is_rejected() {
     let fixture = StreamFixture::new();
     let chat = fixture.sign_event_with(&fixture.owner.clone(), 9, "hi");
-    for bad_role in ["bot", "guest"] {
+    for bad_role in ["guest"] {
         let mut members = fixture.members.clone();
         members[2].1 = bad_role.to_string();
         assert!(
@@ -1136,22 +1136,24 @@ fn stream_roster_with_bot_or_guest_role_is_rejected() {
 }
 
 #[test]
-fn stream_roster_with_agent_role_is_accepted() {
+fn stream_roster_with_agent_or_bot_role_is_accepted() {
     // Regression (live failure 2026-09-19): Buzz assigns co-located agent
-    // members the `agent` role in a group channel (buzz-relay api
-    // `("agent", agent)`), but the role gate only admitted owner/admin/member
-    // — so every real agent group channel was rejected with "unsupported Buzz
-    // membership role". `agent` must be accepted; bot/guest stay rejected
-    // (test above), so this is a targeted widening, not an open door.
+    // members a bot/agent role in a group channel — the hosted relay uses
+    // `bot`, the local relay api uses `agent`. The role gate admitted only
+    // owner/admin/member, so every real agent group channel was rejected
+    // "unsupported Buzz membership role: bot". Both must be accepted; `guest`
+    // stays rejected (test below), so this is a targeted widening.
     let fixture = StreamFixture::new();
     let chat = fixture.sign_event_with(&fixture.owner.clone(), 9, "hi");
-    let mut members = fixture.members.clone();
-    members[1].1 = "agent".to_string();
-    members[2].1 = "agent".to_string();
-    let params = fixture
-        .build_with_members(std::slice::from_ref(&chat), &members)
-        .expect("a stream roster with agent-role members must be accepted");
-    assert_eq!(params["_meta"]["buzz"]["channel"]["type"], json!("stream"));
+    for agent_role in ["agent", "bot"] {
+        let mut members = fixture.members.clone();
+        members[1].1 = agent_role.to_string();
+        members[2].1 = agent_role.to_string();
+        let params = fixture
+            .build_with_members(std::slice::from_ref(&chat), &members)
+            .unwrap_or_else(|e| panic!("a stream roster with {agent_role}-role members must be accepted: {e}"));
+        assert_eq!(params["_meta"]["buzz"]["channel"]["type"], json!("stream"));
+    }
 }
 
 #[test]
