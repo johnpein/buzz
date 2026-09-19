@@ -1136,6 +1136,25 @@ fn stream_roster_with_bot_or_guest_role_is_rejected() {
 }
 
 #[test]
+fn stream_roster_with_agent_role_is_accepted() {
+    // Regression (live failure 2026-09-19): Buzz assigns co-located agent
+    // members the `agent` role in a group channel (buzz-relay api
+    // `("agent", agent)`), but the role gate only admitted owner/admin/member
+    // — so every real agent group channel was rejected with "unsupported Buzz
+    // membership role". `agent` must be accepted; bot/guest stay rejected
+    // (test above), so this is a targeted widening, not an open door.
+    let fixture = StreamFixture::new();
+    let chat = fixture.sign_event_with(&fixture.owner.clone(), 9, "hi");
+    let mut members = fixture.members.clone();
+    members[1].1 = "agent".to_string();
+    members[2].1 = "agent".to_string();
+    let params = fixture
+        .build_with_members(std::slice::from_ref(&chat), &members)
+        .expect("a stream roster with agent-role members must be accepted");
+    assert_eq!(params["_meta"]["buzz"]["channel"]["type"], json!("stream"));
+}
+
+#[test]
 fn stream_author_not_in_roster_is_rejected() {
     let fixture = StreamFixture::new();
     let outsider = Keys::generate();
