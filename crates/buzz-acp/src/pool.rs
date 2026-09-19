@@ -3652,7 +3652,19 @@ async fn build_verified_buzz_prompt_params_for_batch(
             events: &events,
         },
     )
-    .map_err(|_| AcpError::Protocol("Buzz prompt envelope validation failed".into()))?;
+    .map_err(|e| {
+        // Loud-failure discipline: surface the specific reason instead of
+        // swallowing it. The `{e:#}` chain carries the exact bail from
+        // `buzz_envelope` (e.g. channel-type/roster/author), and channel_type
+        // + member_count give the decisive context for a group-channel reject.
+        tracing::warn!(
+            channel_id = %batch.channel_id,
+            channel_type = %channel_info.channel_type,
+            member_count = members.len(),
+            "Buzz prompt envelope validation failed: {e:#}"
+        );
+        AcpError::Protocol(format!("Buzz prompt envelope validation failed: {e:#}"))
+    })?;
     let publish = ctx
         .trusted_publish
         .as_ref()
