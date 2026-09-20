@@ -637,13 +637,6 @@ enum RelayMessage {
 const MEMBERSHIP_NOTIF_SUB_ID: &str = "membership-notif";
 /// Subscription ID for encrypted owner-to-agent observer control frames.
 const OBSERVER_CONTROL_SUB_ID: &str = "agent-observer-control";
-/// Subscription ID for the global group-chat floor-lease grant overlay
-/// (`kind:39007`, see `crate::floor_client`). Global rather than per-channel
-/// and carries no `#p` tag filter — a grant naming a sibling agent (or the
-/// "floor cleared" `status=open` variant, which carries no `p` tag at all)
-/// must still reach this client so `acquire_floor` can resolve promptly
-/// instead of only ever seeing grants that name this agent.
-const FLOOR_GRANT_SUB_ID: &str = "floor-grant";
 
 /// Commands sent from `HarnessRelay` to the background WebSocket task.
 enum RelayCommand {
@@ -663,9 +656,6 @@ enum RelayCommand {
     SubscribeMembership,
     /// Subscribe to encrypted observer control frames addressed to this agent.
     SubscribeObserverControls,
-    /// Subscribe to the global group-chat floor-lease grant overlay
-    /// (`kind:39007`, see `crate::floor_client`).
-    SubscribeFloorGrant,
     /// Publish a signed event to the relay (for typing indicators, etc.).
     PublishEvent { event: Box<Event> },
     /// Floor `since` for membership notification replay; events before startup are never re-delivered.
@@ -686,9 +676,6 @@ pub struct HarnessRelay {
     event_rx: mpsc::Receiver<Option<BuzzEvent>>,
     /// Receiver for encrypted observer control events addressed to this agent.
     observer_control_rx: Option<mpsc::Receiver<Event>>,
-    /// Receiver for group-chat floor-lease grant events (`kind:39007`,
-    /// see `crate::floor_client`).
-    floor_grant_rx: Option<mpsc::Receiver<Event>>,
     /// Sender for commands to the background task.
     cmd_tx: mpsc::Sender<RelayCommand>,
     /// HTTP client for HTTP bridge calls.
@@ -763,7 +750,6 @@ impl HarnessRelay {
         let (event_tx, event_rx) = mpsc::channel::<Option<BuzzEvent>>(event_channel_capacity());
         let (observer_control_tx, observer_control_rx) =
             mpsc::channel::<Event>(event_channel_capacity());
-        let (floor_grant_tx, floor_grant_rx) = mpsc::channel::<Event>(event_channel_capacity());
         let (cmd_tx, cmd_rx) = mpsc::channel::<RelayCommand>(CMD_CHANNEL_CAPACITY);
 
         let bg_keys = keys.clone();
@@ -777,7 +763,6 @@ impl HarnessRelay {
                 handshake_buffer,
                 event_tx,
                 observer_control_tx,
-                floor_grant_tx,
                 cmd_rx,
                 bg_keys,
                 bg_relay_url,
@@ -790,7 +775,6 @@ impl HarnessRelay {
         Ok(Self {
             event_rx,
             observer_control_rx: Some(observer_control_rx),
-            floor_grant_rx: Some(floor_grant_rx),
             cmd_tx,
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
@@ -942,21 +926,6 @@ impl HarnessRelay {
     /// Take the observer-control receiver for polling outside this relay object.
     pub fn take_observer_control_rx(&mut self) -> Option<mpsc::Receiver<Event>> {
         self.observer_control_rx.take()
-    }
-
-    /// Subscribe to the global group-chat floor-lease grant overlay
-    /// (`kind:39007`, see `crate::floor_client`).
-    pub async fn subscribe_floor_grant(&mut self) -> Result<(), RelayError> {
-        self.cmd_tx
-            .send(RelayCommand::SubscribeFloorGrant)
-            .await
-            .map_err(|_| RelayError::ConnectionClosed)?;
-        Ok(())
-    }
-
-    /// Take the floor-grant receiver for polling outside this relay object.
-    pub fn take_floor_grant_rx(&mut self) -> Option<mpsc::Receiver<Event>> {
-        self.floor_grant_rx.take()
     }
 
     /// Return a cloneable publisher handle for signed relay events.
@@ -1165,8 +1134,6 @@ struct BgState {
     membership_sub_active: bool,
     /// Whether the observer control subscription is active.
     observer_control_sub_active: bool,
-    /// Whether the floor-grant overlay subscription (`kind:39007`) is active.
-    floor_grant_sub_active: bool,
     /// Oldest dropped channel-event timestamp per channel, keyed by channel_id.
     /// Mirrors `membership_dropped_since` but for ordinary channel events.
     /// On reconnect resubscribe, `since` = min(last_seen, channel_dropped_since).
@@ -1207,10 +1174,6 @@ struct BgState {
     /// subscription. The main-loop drain re-sends the REQ once the gate clears,
     /// even when `rate_limited_pending` is empty.
     observer_resub_needed: bool,
-    /// Set when a rate-limited CLOSED arrives for the floor-grant overlay
-    /// subscription. The main-loop drain re-sends the REQ once the gate clears,
-    /// even when `rate_limited_pending` is empty.
-    floor_grant_resub_needed: bool,
     /// Observer telemetry frames (kind 24200) parked while the rate-limit gate
     /// is armed. Unlike typing indicators, these frames are durable telemetry:
     /// dropping them silently loses turn history in the Desktop observer.
@@ -1248,7 +1211,6 @@ impl BgState {
             membership_last_seen: None,
             membership_sub_active: false,
             observer_control_sub_active: false,
-            floor_grant_sub_active: false,
             channel_dropped_since: HashMap::new(),
             proactive_resubscribe_needed: false,
             startup_watermark: None,
@@ -1257,7 +1219,6 @@ impl BgState {
             rate_limited_pending: HashMap::new(),
             membership_resub_needed: false,
             observer_resub_needed: false,
-            floor_grant_resub_needed: false,
             gated_observer_pending: VecDeque::new(),
             observer_in_flight: VecDeque::new(),
             gated_observer_dropped: 0,
@@ -1450,9 +1411,6 @@ fn apply_command_to_state(state: &mut BgState, cmd: RelayCommand) {
         }
         RelayCommand::SubscribeObserverControls => {
             state.observer_control_sub_active = true;
-        }
-        RelayCommand::SubscribeFloorGrant => {
-            state.floor_grant_sub_active = true;
         }
         RelayCommand::SetStartupWatermark { ts } => {
             state.startup_watermark = Some(ts);
@@ -1648,23 +1606,6 @@ async fn execute_connected_command(
                 false
             }
         }
-        RelayCommand::SubscribeFloorGrant => {
-            state.floor_grant_sub_active = true;
-            if state.check_rate_gate().is_some() {
-                debug!("rate-gated: deferring floor-grant subscription");
-                state.floor_grant_resub_needed = true;
-                return true;
-            }
-            let sent = send_floor_grant_subscribe(ws).await;
-            if sent {
-                state.floor_grant_resub_needed = false;
-                true
-            } else {
-                warn!("floor-grant subscribe REQ failed — recording intent for reconnect");
-                state.floor_grant_resub_needed = true;
-                false
-            }
-        }
         RelayCommand::PublishEvent { event } => {
             // Observer telemetry frames (kind 24200) are durable telemetry, not
             // droppable ephemera: park them while the rate-limit gate is armed —
@@ -1736,7 +1677,6 @@ async fn run_background_task(
     initial_handshake_buffer: std::collections::VecDeque<RelayMessage>,
     event_tx: mpsc::Sender<Option<BuzzEvent>>,
     observer_control_tx: mpsc::Sender<Event>,
-    floor_grant_tx: mpsc::Sender<Event>,
     mut cmd_rx: mpsc::Receiver<RelayCommand>,
     keys: Keys,
     relay_url: String,
@@ -1750,7 +1690,6 @@ async fn run_background_task(
         initial_handshake_buffer,
         &event_tx,
         &observer_control_tx,
-        &floor_grant_tx,
         &mut state,
         &keys,
         &relay_url,
@@ -1772,7 +1711,6 @@ async fn run_background_task(
             &agent_pubkey_hex,
             &event_tx,
             &observer_control_tx,
-            &floor_grant_tx,
             auth_tag.as_ref(),
         )
         .await
@@ -1797,7 +1735,6 @@ async fn run_background_task(
                         &agent_pubkey_hex,
                         &event_tx,
                         &observer_control_tx,
-                        &floor_grant_tx,
                         true,
                         auth_tag.as_ref(),
                     )
@@ -1857,7 +1794,6 @@ async fn run_background_task(
                         &agent_pubkey_hex,
                         &event_tx,
                         &observer_control_tx,
-                        &floor_grant_tx,
                         auth_tag.as_ref(),
                     )
                     .await
@@ -1888,7 +1824,6 @@ async fn run_background_task(
                                     &agent_pubkey_hex,
                                     &event_tx,
                                     &observer_control_tx,
-                                    &floor_grant_tx,
                                     true,
                                     auth_tag.as_ref(),
                                 )
@@ -1947,15 +1882,6 @@ async fn run_background_task(
                         );
                     }
                 }
-                if state.floor_grant_resub_needed && budget > 0 {
-                    if send_floor_grant_subscribe(&mut ws).await {
-                        state.floor_grant_resub_needed = false;
-                        budget = budget.saturating_sub(1);
-                        any_sent = true;
-                    } else {
-                        warn!("floor-grant resub after rate-limit failed — will retry next drain");
-                    }
-                }
             }
 
             if budget > 0 && !state.rate_limited_pending.is_empty() {
@@ -2011,7 +1937,6 @@ async fn run_background_task(
                                        &mut ws,
                                        &event_tx,
                                        &observer_control_tx,
-            &floor_grant_tx,
                                        &mut state,
                                        &keys,
                                        &relay_url,
@@ -2045,7 +1970,6 @@ async fn run_background_task(
                                &agent_pubkey_hex,
                                &event_tx,
                            &observer_control_tx,
-            &floor_grant_tx,
             auth_tag.as_ref(),
                            )
                            .await;
@@ -2066,8 +1990,7 @@ async fn run_background_task(
                                if matches!(
                                    wait_for_reconnect(
                                        &mut ws, &mut cmd_rx, &mut state, &keys, &relay_url,
-        &agent_pubkey_hex, &event_tx, &observer_control_tx,
-            &floor_grant_tx, true,
+        &agent_pubkey_hex, &event_tx, &observer_control_tx, true,
                         auth_tag.as_ref(),
                                    ).await,
                                    ReconnectOutcome::Shutdown
@@ -2087,8 +2010,7 @@ async fn run_background_task(
                                if matches!(
                                    wait_for_reconnect(
                                        &mut ws, &mut cmd_rx, &mut state, &keys, &relay_url,
-        &agent_pubkey_hex, &event_tx, &observer_control_tx,
-            &floor_grant_tx, true,
+        &agent_pubkey_hex, &event_tx, &observer_control_tx, true,
                         auth_tag.as_ref(),
                                    ).await,
                                    ReconnectOutcome::Shutdown
@@ -2124,7 +2046,6 @@ async fn run_background_task(
                                        &mut ws, &mut cmd_rx, &mut state, &keys, &relay_url,
         &agent_pubkey_hex, &event_tx,
                                    &observer_control_tx,
-            &floor_grant_tx,
             auth_tag.as_ref(),
                                    ).await {
                                        ReconnectOutcome::Shutdown => return,
@@ -2138,8 +2059,7 @@ async fn run_background_task(
                                            if matches!(
                                                wait_for_reconnect(
                                                    &mut ws, &mut cmd_rx, &mut state, &keys, &relay_url,
-        &agent_pubkey_hex, &event_tx, &observer_control_tx,
-            &floor_grant_tx, true,
+        &agent_pubkey_hex, &event_tx, &observer_control_tx, true,
                         auth_tag.as_ref(),
                                                ).await,
                                                ReconnectOutcome::Shutdown
@@ -2165,7 +2085,6 @@ async fn run_background_task(
                                &mut ws, &mut cmd_rx, &mut state, &keys, &relay_url,
         &agent_pubkey_hex, &event_tx,
                            &observer_control_tx,
-            &floor_grant_tx,
             auth_tag.as_ref(),
                            ).await {
                                ReconnectOutcome::Shutdown => return,
@@ -2179,8 +2098,7 @@ async fn run_background_task(
                                    if matches!(
                                        wait_for_reconnect(
                                            &mut ws, &mut cmd_rx, &mut state, &keys, &relay_url,
-        &agent_pubkey_hex, &event_tx, &observer_control_tx,
-            &floor_grant_tx, true,
+        &agent_pubkey_hex, &event_tx, &observer_control_tx, true,
                         auth_tag.as_ref(),
                                        ).await,
                                        ReconnectOutcome::Shutdown
@@ -2200,7 +2118,6 @@ async fn run_background_task(
                                    &mut ws, &mut cmd_rx, &mut state, &keys, &relay_url,
         &agent_pubkey_hex, &event_tx,
                                &observer_control_tx,
-            &floor_grant_tx,
             auth_tag.as_ref(),
                                ).await {
                                    ReconnectOutcome::Shutdown => return,
@@ -2214,8 +2131,7 @@ async fn run_background_task(
                                        if matches!(
                                            wait_for_reconnect(
                                                &mut ws, &mut cmd_rx, &mut state, &keys, &relay_url,
-        &agent_pubkey_hex, &event_tx, &observer_control_tx,
-            &floor_grant_tx, true,
+        &agent_pubkey_hex, &event_tx, &observer_control_tx, true,
                         auth_tag.as_ref(),
                                            ).await,
                                            ReconnectOutcome::Shutdown
@@ -2270,7 +2186,6 @@ async fn handle_ws_message(
     ws: &mut WsStream,
     event_tx: &mpsc::Sender<Option<BuzzEvent>>,
     observer_control_tx: &mpsc::Sender<Event>,
-    floor_grant_tx: &mpsc::Sender<Event>,
     state: &mut BgState,
     keys: &Keys,
     relay_url: &str,
@@ -2297,20 +2212,6 @@ async fn handle_ws_message(
                             Ok(()) => {}
                             Err(mpsc::error::TrySendError::Full(_)) => {
                                 warn!("observer control event dropped because control channel is full");
-                            }
-                            Err(mpsc::error::TrySendError::Closed(_)) => return false,
-                        }
-                    } else if subscription_id == FLOOR_GRANT_SUB_ID {
-                        match floor_grant_tx.try_send(*event) {
-                            Ok(()) => {}
-                            Err(mpsc::error::TrySendError::Full(_)) => {
-                                // Bounded, best-effort: a dropped grant just means
-                                // an in-flight acquire_floor() falls through to its
-                                // own timeout — never a wrongful publish, since the
-                                // relay remains the sole floor authority.
-                                warn!(
-                                    "floor-grant event dropped because floor-grant channel is full"
-                                );
                             }
                             Err(mpsc::error::TrySendError::Closed(_)) => return false,
                         }
@@ -2482,8 +2383,6 @@ async fn handle_ws_message(
                             state.membership_resub_needed = true;
                         } else if subscription_id == OBSERVER_CONTROL_SUB_ID {
                             state.observer_resub_needed = true;
-                        } else if subscription_id == FLOOR_GRANT_SUB_ID {
-                            state.floor_grant_resub_needed = true;
                         }
                         return true; // keep the socket
                     }
@@ -2516,14 +2415,6 @@ async fn handle_ws_message(
                             state.observer_control_sub_active = true;
                         } else {
                             warn!("observer control resubscribe failed after CLOSED — triggering reconnect");
-                            return false;
-                        }
-                    } else if subscription_id == FLOOR_GRANT_SUB_ID {
-                        let sent = send_floor_grant_subscribe(ws).await;
-                        if sent {
-                            state.floor_grant_sub_active = true;
-                        } else {
-                            warn!("floor-grant resubscribe failed after CLOSED — triggering reconnect");
                             return false;
                         }
                     } else if subscription_id == MEMBERSHIP_NOTIF_SUB_ID {
@@ -2645,7 +2536,6 @@ async fn process_handshake_buffer(
     buffer: std::collections::VecDeque<RelayMessage>,
     event_tx: &mpsc::Sender<Option<BuzzEvent>>,
     observer_control_tx: &mpsc::Sender<Event>,
-    floor_grant_tx: &mpsc::Sender<Event>,
     state: &mut BgState,
     keys: &Keys,
     relay_url: &str,
@@ -2689,7 +2579,6 @@ async fn process_handshake_buffer(
                 ws,
                 event_tx,
                 observer_control_tx,
-                floor_grant_tx,
                 state,
                 keys,
                 relay_url,
@@ -2846,23 +2735,6 @@ async fn resubscribe_after_reconnect(
                 return ResubscribeResult::RetryConnection;
             }
             state.observer_resub_needed = false;
-        }
-    }
-
-    if state.floor_grant_sub_active {
-        if state.check_rate_gate().is_some() {
-            debug!("rate-gated: parking floor-grant resubscribe after reconnect");
-            state.floor_grant_resub_needed = true;
-        } else {
-            if !pacing_sleep(cmd_rx, &mut deferred_commands, REQ_PACING_INTERVAL).await {
-                return ResubscribeResult::Shutdown;
-            }
-            if !send_floor_grant_subscribe(ws).await {
-                warn!("failed to resubscribe floor grant after reconnect");
-                retain_deferred_command_intent(state, &mut deferred_commands);
-                return ResubscribeResult::RetryConnection;
-            }
-            state.floor_grant_resub_needed = false;
         }
     }
 
@@ -3102,8 +2974,7 @@ async fn drain_commands(
             }
             RelayCommand::Subscribe { .. }
             | RelayCommand::SubscribeMembership
-            | RelayCommand::SubscribeObserverControls
-            | RelayCommand::SubscribeFloorGrant => {
+            | RelayCommand::SubscribeObserverControls => {
                 // A gated subscription is only parked in state; pace only an
                 // actual live send attempt.
                 let pace_after = state.check_rate_gate().is_none();
@@ -3169,7 +3040,6 @@ async fn try_autonomous_reconnect(
     agent_pubkey_hex: &str,
     event_tx: &mpsc::Sender<Option<BuzzEvent>>,
     observer_control_tx: &mpsc::Sender<Event>,
-    floor_grant_tx: &mpsc::Sender<Event>,
     auth_tag: Option<&nostr::Tag>,
 ) -> ReconnectOutcome {
     state.requeue_observer_in_flight();
@@ -3201,7 +3071,6 @@ async fn try_autonomous_reconnect(
                     handshake_buffer,
                     event_tx,
                     observer_control_tx,
-                    floor_grant_tx,
                     state,
                     keys,
                     relay_url,
@@ -3300,7 +3169,6 @@ async fn wait_for_reconnect(
     agent_pubkey_hex: &str,
     event_tx: &mpsc::Sender<Option<BuzzEvent>>,
     observer_control_tx: &mpsc::Sender<Event>,
-    floor_grant_tx: &mpsc::Sender<Event>,
     skip_drain: bool,
     auth_tag: Option<&nostr::Tag>,
 ) -> ReconnectOutcome {
@@ -3341,7 +3209,6 @@ async fn wait_for_reconnect(
                     handshake_buffer,
                     event_tx,
                     observer_control_tx,
-                    floor_grant_tx,
                     state,
                     keys,
                     relay_url,
@@ -3573,47 +3440,6 @@ async fn send_observer_control_subscribe(ws: &mut WsStream, agent_pubkey_hex: &s
         }
         Err(e) => {
             warn!("failed to serialize observer control REQ: {e}");
-            false
-        }
-    }
-}
-
-/// Send a NIP-01 REQ for the global group-chat floor-lease grant overlay
-/// (`kind:39007`, see `crate::floor_client`).
-///
-/// Deliberately carries no `#p` (or `#h`) tag filter, unlike
-/// [`send_observer_control_subscribe`]: a grant naming a sibling agent, or
-/// the "floor cleared" `status=open` variant (which carries no `p` tag at
-/// all), must still reach this client. `crate::floor_client::acquire_floor`
-/// does its own channel/holder matching on the delivered events.
-async fn send_floor_grant_subscribe(ws: &mut WsStream) -> bool {
-    let req = json!([
-        "REQ",
-        FLOOR_GRANT_SUB_ID,
-        {
-            "kinds": [buzz_core::kind::KIND_FLOOR_GRANT],
-            "since": std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-        }
-    ]);
-
-    match serde_json::to_string(&req) {
-        Ok(text) => {
-            match ws_send_timeout(ws, Message::Text(text.into()), WS_SEND_TIMEOUT_SECS).await {
-                Ok(()) => {
-                    debug!("subscribed to floor-grant overlay");
-                    true
-                }
-                Err(e) => {
-                    warn!("failed to send floor-grant REQ: {e}");
-                    false
-                }
-            }
-        }
-        Err(e) => {
-            warn!("failed to serialize floor-grant REQ: {e}");
             false
         }
     }
