@@ -47,17 +47,6 @@ use crate::relay::{ChannelInfo, RestClient};
 /// the turn as "recently active" (eligible for requeue instead of dead-letter).
 const RECENT_ACTIVITY_WINDOW: Duration = Duration::from_secs(60);
 
-/// Bound on how long `run_prompt_task` waits for a `kind:39007` floor grant
-/// (see `crate::floor_client::acquire_floor`) before giving up and staying
-/// quiet for this batch. A request that arrives while another agent holds
-/// the floor is queued rather than granted immediately (see
-/// `buzz_relay::floor::FloorDecision::Queued`) — the grant only fans out
-/// once that holder publishes or its lease expires. Set safely above the
-/// relay's floor-lease TTL (`buzz_relay::floor::DEFAULT_FLOOR_TTL`, 30s at
-/// time of writing) so a legitimately queued request isn't mistaken for a
-/// dead relay.
-const FLOOR_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(35);
-
 // FlushBatch and BatchEvent derive Clone (added in queue.rs) so we can store
 // a recoverable copy in TaskMeta for panic recovery in Queue mode.
 
@@ -147,14 +136,6 @@ pub struct SessionState {
     /// Per-channel successful-delivery state. Created with the ACP session and
     /// cleared atomically with every invalidation path.
     pub deliveries: HashMap<Uuid, ChannelDeliveryState>,
-    /// channel_id → whether the group-chat floor protocol is enforced for
-    /// this channel (`crate::floor_client::resolve_floor_enforcement`).
-    /// Populated once at session creation, same lifecycle as `core_sections`
-    /// — the roster/sibling-agent classification is one HTTP round trip, not
-    /// worth re-doing every turn. Cleared on session invalidation so a
-    /// roster change (an agent joining or leaving) is picked up by the next
-    /// new session.
-    pub floor_enforced: HashMap<Uuid, bool>,
 }
 
 impl SessionState {
@@ -179,7 +160,6 @@ impl SessionState {
         self.core_sections.remove(channel_id);
         self.canvas_sections.remove(channel_id);
         self.deliveries.remove(channel_id);
-        self.floor_enforced.remove(channel_id);
         self.sessions.remove(channel_id).is_some()
     }
 
@@ -193,7 +173,6 @@ impl SessionState {
         self.core_sections.clear();
         self.canvas_sections.clear();
         self.deliveries.clear();
-        self.floor_enforced.clear();
     }
 
     pub(crate) fn mark_channel_delivery_success(
@@ -214,7 +193,6 @@ impl SessionState {
             || self.core_sections.contains_key(channel_id)
             || self.canvas_sections.contains_key(channel_id)
             || self.deliveries.contains_key(channel_id)
-            || self.floor_enforced.contains_key(channel_id)
     }
 }
 
@@ -775,12 +753,6 @@ pub struct PromptContext {
     /// the desktop keys per (agent, relay) pair, e.g. `session_config_captured`,
     /// mirroring the `managed_agent_runtime_lifecycle` frames.
     pub relay_url: String,
-    /// Broadcast of `kind:39007` floor-grant events (see `crate::floor_client`),
-    /// fed by a forwarder in the main loop that reads
-    /// `HarnessRelay::take_floor_grant_rx()`. A spawned prompt task calls
-    /// `.subscribe()` on this to get its own receiver right before posting a
-    /// floor request, so no grant sent between subscribe and publish is missed.
-    pub floor_grant_tx: tokio::sync::broadcast::Sender<nostr::Event>,
 }
 
 impl AgentPool {
@@ -2121,51 +2093,6 @@ pub async fn run_prompt_task(
                     pending_canvas = Some((*cid, section));
                 }
             }
-            // Group-chat floor-lease enforcement gate (Task 6, see
-            // `floor_client`): resolved once per new channel session, same
-            // lifecycle as core/canvas — the roster + sibling-agent
-            // classification is one or more HTTP round trips, not worth
-            // repeating every turn. An unresolvable roster fails closed to
-            // "not enforced" (a liveness choice, not a safety one: the relay
-            // remains the sole floor authority and rejects any unauthorized
-            // publish regardless of what this cache believes).
-            let floor_enforced = if crate::floor_client::floor_enforcement_applicable(
-                is_dm,
-                ctx.agent_owner_pubkey.is_some(),
-                crate::floor_client::group_floor_enabled(),
-            ) {
-                // `floor_enforcement_applicable` guarantees `agent_owner_pubkey`
-                // is `Some` here.
-                let owner = ctx
-                    .agent_owner_pubkey
-                    .as_ref()
-                    .expect("floor_enforcement_applicable checked has_owner");
-                match fetch_verified_channel_members(*cid, &ctx.rest_client).await {
-                    Ok(members) => {
-                        let my_pubkey = ctx.agent_keys.public_key().to_hex();
-                        crate::floor_client::resolve_floor_enforcement(
-                            origin_channel_type.as_deref().unwrap_or("dm"),
-                            &members,
-                            &my_pubkey,
-                            &owner.to_hex(),
-                            &ctx.rest_client,
-                        )
-                        .await
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            channel_id = %cid,
-                            "floor-enforcement roster lookup failed; treating as not \
-                             enforced for this session: {}",
-                            error
-                        );
-                        false
-                    }
-                }
-            } else {
-                false
-            };
-            agent.state.floor_enforced.insert(*cid, floor_enforced);
         }
     }
 
@@ -2701,86 +2628,6 @@ pub async fn run_prompt_task(
             "eventDeltaCount": pending_delivered_event_ids.len(),
         }),
     );
-
-    // Group-chat floor-lease gate (Task 6, see `floor_client`): for a
-    // floor-enforced channel, request the floor and wait for a decisive
-    // grant BEFORE running the CE turn or publishing. On anything other
-    // than `Granted`, the agent stays quiet for this batch — no turn runs,
-    // no publish happens — and the batch is treated as handled (not
-    // requeued) so the room isn't retried into a thrash loop. Ordinary DM
-    // channels and non-enforced stream channels bypass this entirely via
-    // the cached `floor_enforced` flag (`false` unless explicitly set true).
-    if let PromptSource::Channel(cid) = &source {
-        if agent
-            .state
-            .floor_enforced
-            .get(cid)
-            .copied()
-            .unwrap_or(false)
-        {
-            let mut grant_rx = ctx.floor_grant_tx.subscribe();
-            let floor_rest_client = ctx.rest_client.clone();
-            let acquired = crate::floor_client::acquire_floor(
-                *cid,
-                &ctx.agent_keys,
-                &mut grant_rx,
-                FLOOR_ACQUIRE_TIMEOUT,
-                move |event| async move {
-                    floor_rest_client.submit_event(&event).await.map(|_| ())
-                },
-            )
-            .await;
-            let granted = matches!(acquired, Ok(crate::floor_client::FloorAcquire::Granted));
-            if !granted {
-                match &acquired {
-                    Ok(outcome) => {
-                        tracing::info!(
-                            target: "pool::floor",
-                            channel_id = %cid,
-                            outcome = ?outcome,
-                            "floor not granted — staying quiet this turn"
-                        );
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            target: "pool::floor",
-                            channel_id = %cid,
-                            "floor request failed — staying quiet this turn: {error}"
-                        );
-                    }
-                }
-                agent.acp.observe(
-                    "floor_not_granted",
-                    serde_json::json!({ "channelId": cid.to_string() }),
-                );
-                record_channel_delivery_success(
-                    &mut agent,
-                    *cid,
-                    false,
-                    &pending_delivered_event_ids,
-                );
-                let usage = agent.acp.take_turn_usage();
-                publish_agent_turn_metric(
-                    &ctx,
-                    usage,
-                    observer_channel_id,
-                    &session_id,
-                    &turn_id,
-                    Some(buzz_core::agent_turn_metric::StopReason::EndTurn),
-                )
-                .await;
-                send_prompt_result(
-                    &result_tx,
-                    &turn_id,
-                    agent,
-                    source,
-                    PromptOutcome::Ok(StopReason::EndTurn),
-                    None,
-                );
-                return;
-            }
-        }
-    }
 
     // Turn start, labelled exactly as `log_stop_reason` labels the end, so a
     // log reads as start/stop pairs. Purely observational: an unpaired start is
@@ -8904,7 +8751,6 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             managed_agent_pubkey_pin: None,
             trusted_publish: None,
             relay_url: "ws://127.0.0.1:3000".to_string(),
-            floor_grant_tx: tokio::sync::broadcast::channel(16).0,
         }
     }
 

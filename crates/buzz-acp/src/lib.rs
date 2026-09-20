@@ -5,7 +5,6 @@ mod buzz_envelope;
 mod config;
 mod engram_fetch;
 mod filter;
-mod floor_client;
 mod observer;
 mod pool;
 mod pool_lifecycle;
@@ -2246,37 +2245,6 @@ async fn tokio_main() -> Result<()> {
     let managed_agent_pubkey_pin = config
         .trusted_outbox_harness
         .map(|_| config.keys.public_key().to_hex());
-
-    // Group-chat floor-lease grant fan-out (Task 6, see `floor_client`):
-    // subscribe once, globally, to the relay's `kind:39007` overlay, then
-    // forward every delivered event into a broadcast channel each spawned
-    // prompt task can `.subscribe()` to right before posting its own
-    // `kind:20003` request. Best-effort — a dropped/missed grant just makes
-    // `floor_client::acquire_floor` fall through to its own timeout, never a
-    // wrongful publish, since the relay remains the sole floor authority.
-    relay
-        .subscribe_floor_grant()
-        .await
-        .map_err(|e| anyhow::anyhow!("floor-grant subscribe error: {e}"))?;
-    let floor_grant_relay_rx = relay.take_floor_grant_rx();
-    // The initial broadcast::Receiver is discarded — each prompt task gets
-    // its own via `floor_grant_tx.subscribe()` right before it needs one;
-    // `Sender::send()` tolerates zero current subscribers (returns an `Err`
-    // this forwarder discards, matching "best-effort" above).
-    let (floor_grant_tx, _) = tokio::sync::broadcast::channel::<nostr::Event>(64);
-    if let Some(mut floor_grant_relay_rx) = floor_grant_relay_rx {
-        let floor_grant_tx_fwd = floor_grant_tx.clone();
-        tokio::spawn(async move {
-            while let Some(event) = floor_grant_relay_rx.recv().await {
-                // No subscribed receiver is not an error — every prompt task
-                // subscribes lazily, only while actually awaiting a grant.
-                let _ = floor_grant_tx_fwd.send(event);
-            }
-        });
-    } else {
-        tracing::warn!("floor-grant receiver unavailable — floor protocol will always time out");
-    }
-
     let ctx = Arc::new(PromptContext {
         mcp_servers: build_mcp_servers(&config),
         initial_message: config.initial_message.clone(),
@@ -2310,7 +2278,6 @@ async fn tokio_main() -> Result<()> {
         managed_agent_pubkey_pin,
         trusted_publish: config.trusted_publish.clone(),
         relay_url: config.relay_url.clone(),
-        floor_grant_tx,
     });
 
     if !config.memory_enabled {
