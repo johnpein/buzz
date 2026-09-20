@@ -37,6 +37,67 @@ pub(crate) struct Cursor {
     pub created_at: Timestamp,
 }
 
+/// Why a fetched room message was left out of the catch-up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dropped {
+    NotChat,
+    Own,
+    NotBeforeBatch,
+    InBatch,
+    BeforeCursor,
+    NotOnRoster,
+    OtherChannel,
+    BadSignature,
+    Duplicate,
+    OverLimit,
+}
+
+/// What a catch-up fetch saw and kept. Logged once per stream delivery so a
+/// surprising count (e.g. 0 where the room was busy) names its own cause.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct Tally {
+    pub fetched: usize,
+    /// Fetched messages that are thread replies (carry an `e` tag). Zero in a
+    /// busy threaded room means the relay's channel query omits thread replies.
+    pub fetched_thread_replies: usize,
+    pub kept: usize,
+    pub not_chat: usize,
+    pub own: usize,
+    pub not_before_batch: usize,
+    pub in_batch: usize,
+    pub before_cursor: usize,
+    pub not_on_roster: usize,
+    pub other_channel: usize,
+    pub bad_signature: usize,
+    pub duplicate: usize,
+    pub over_limit: usize,
+}
+
+impl Tally {
+    fn count(&mut self, reason: Dropped) {
+        let slot = match reason {
+            Dropped::NotChat => &mut self.not_chat,
+            Dropped::Own => &mut self.own,
+            Dropped::NotBeforeBatch => &mut self.not_before_batch,
+            Dropped::InBatch => &mut self.in_batch,
+            Dropped::BeforeCursor => &mut self.before_cursor,
+            Dropped::NotOnRoster => &mut self.not_on_roster,
+            Dropped::OtherChannel => &mut self.other_channel,
+            Dropped::BadSignature => &mut self.bad_signature,
+            Dropped::Duplicate => &mut self.duplicate,
+            Dropped::OverLimit => &mut self.over_limit,
+        };
+        *slot += 1;
+    }
+}
+
+fn is_thread_reply(event: &Event) -> bool {
+    event
+        .tags
+        .iter()
+        .any(|tag| tag.as_slice().first().map(String::as_str) == Some("e"))
+}
+
 /// Choose the catch-up events for one delivery from the channel's candidates.
 pub(crate) fn select(
     candidates: Vec<Event>,
@@ -45,35 +106,58 @@ pub(crate) fn select(
     own_pubkey: &PublicKey,
     channel_id: Uuid,
     cursor: Option<Cursor>,
-) -> Vec<Event> {
+) -> (Vec<Event>, Tally) {
+    let mut tally = Tally {
+        fetched: candidates.len(),
+        fetched_thread_replies: candidates
+            .iter()
+            .filter(|event| is_thread_reply(event))
+            .count(),
+        ..Tally::default()
+    };
     let Some(window_closes) = batch.iter().map(|event| event.created_at).min() else {
-        return Vec::new();
+        return (Vec::new(), tally);
     };
     let channel = channel_id.to_string();
     let batch_ids: HashSet<EventId> = batch.iter().map(|event| event.id).collect();
     let mut seen = HashSet::new();
-    let mut selected: Vec<Event> = candidates
-        .into_iter()
-        .filter(|event| {
-            event.kind == Kind::Custom(9)
-                && event.pubkey != *own_pubkey
-                && event.created_at < window_closes
-                && !batch_ids.contains(&event.id)
-                && cursor.is_none_or(|cursor| {
-                    event.created_at >= cursor.created_at && event.id != cursor.event_id
-                })
-                && roster
-                    .iter()
-                    .any(|member| member.eq_ignore_ascii_case(&event.pubkey.to_hex()))
-                && event.tags.iter().any(|tag| {
-                    let values = tag.as_slice();
-                    values.first().map(String::as_str) == Some("h")
-                        && values.get(1).map(String::as_str) == Some(channel.as_str())
-                })
-                && event.verify().is_ok()
-                && seen.insert(event.id)
-        })
-        .collect();
+    let mut selected: Vec<Event> = Vec::new();
+    for event in candidates {
+        let dropped = if event.kind != Kind::Custom(9) {
+            Some(Dropped::NotChat)
+        } else if event.pubkey == *own_pubkey {
+            Some(Dropped::Own)
+        } else if batch_ids.contains(&event.id) {
+            Some(Dropped::InBatch)
+        } else if event.created_at >= window_closes {
+            Some(Dropped::NotBeforeBatch)
+        } else if cursor.is_some_and(|cursor| {
+            event.created_at < cursor.created_at || event.id == cursor.event_id
+        }) {
+            Some(Dropped::BeforeCursor)
+        } else if !roster
+            .iter()
+            .any(|member| member.eq_ignore_ascii_case(&event.pubkey.to_hex()))
+        {
+            Some(Dropped::NotOnRoster)
+        } else if !event.tags.iter().any(|tag| {
+            let values = tag.as_slice();
+            values.first().map(String::as_str) == Some("h")
+                && values.get(1).map(String::as_str) == Some(channel.as_str())
+        }) {
+            Some(Dropped::OtherChannel)
+        } else if event.verify().is_err() {
+            Some(Dropped::BadSignature)
+        } else if !seen.insert(event.id) {
+            Some(Dropped::Duplicate)
+        } else {
+            None
+        };
+        match dropped {
+            Some(reason) => tally.count(reason),
+            None => selected.push(event),
+        }
+    }
     selected.sort_by(|left, right| {
         left.created_at
             .cmp(&right.created_at)
@@ -85,7 +169,12 @@ pub(crate) fn select(
         FIRST_TURN_CATCHUP_EVENTS
     };
     let excess = selected.len().saturating_sub(limit);
-    selected.split_off(excess)
+    for _ in 0..excess {
+        tally.count(Dropped::OverLimit);
+    }
+    let kept = selected.split_off(excess);
+    tally.kept = kept.len();
+    (kept, tally)
 }
 
 /// The message a reply answers: its `e` tag marked `reply`.
@@ -123,11 +212,9 @@ pub(crate) async fn fetch(
         .custom_tags(h_tag, [channel.clone()])
         .until(window_closes)
         .limit(1);
-    let cursor = match query(rest, own_last_reply)
-        .await?
-        .first()
-        .and_then(replied_to)
-    {
+    let own_last_reply = query(rest, own_last_reply).await?;
+    let own_last_reply_found = !own_last_reply.is_empty();
+    let cursor = match own_last_reply.first().and_then(replied_to) {
         Some(parent_id) => query(rest, Filter::new().id(parent_id).limit(1))
             .await?
             .into_iter()
@@ -148,9 +235,16 @@ pub(crate) async fn fetch(
         room = room.since(cursor.created_at);
     }
     let candidates = query(rest, room).await?;
-    Ok(select(
-        candidates, batch, roster, own_pubkey, channel_id, cursor,
-    ))
+    let (catchup, tally) = select(candidates, batch, roster, own_pubkey, channel_id, cursor);
+    tracing::info!(
+        channel_id = %channel_id,
+        own_last_reply_found,
+        cursor_at = cursor.map(|cursor| cursor.created_at.as_secs()),
+        window_closes = window_closes.as_secs(),
+        ?tally,
+        "room catch-up selection"
+    );
+    Ok(catchup)
 }
 
 async fn query(rest: &RestClient, filter: Filter) -> Result<Vec<Event>, String> {
@@ -242,7 +336,7 @@ mod tests {
             trigger.clone(),
             message(&room.sibling, 250, "after the trigger", CHANNEL, None),
         ];
-        let selected = select(
+        let (selected, _tally) = select(
             candidates,
             std::slice::from_ref(&trigger),
             &room.roster,
@@ -276,7 +370,7 @@ mod tests {
             serde_json::from_value(forged).expect("forged event"),
             message(&room.sibling, 160, "legitimate", CHANNEL, None),
         ];
-        let selected = select(
+        let (selected, _tally) = select(
             candidates,
             std::slice::from_ref(&trigger),
             &room.roster,
@@ -303,7 +397,7 @@ mod tests {
             })
             .collect();
         let previous = message(&room.owner, 1, "start", CHANNEL, None);
-        let bounded = select(
+        let (bounded, bounded_tally) = select(
             candidates.clone(),
             std::slice::from_ref(&trigger),
             &room.roster,
@@ -315,6 +409,7 @@ mod tests {
             }),
         );
         assert_eq!(bounded.len(), MAX_CATCHUP_EVENTS);
+        assert_eq!(bounded_tally.over_limit, 100 - MAX_CATCHUP_EVENTS);
         assert_eq!(
             bounded.first().map(|event| event.content.as_str()),
             Some("m60")
@@ -324,7 +419,7 @@ mod tests {
             Some("m99")
         );
 
-        let first_turn = select(
+        let (first_turn, _tally) = select(
             candidates,
             std::slice::from_ref(&trigger),
             &room.roster,
@@ -357,6 +452,7 @@ mod tests {
                 room.channel,
                 None,
             )
+            .0
             .iter()
             .map(|event| event.id)
             .collect::<Vec<_>>()
@@ -374,5 +470,57 @@ mod tests {
         let reply = message(&room.me, 110, "answer", CHANNEL, Some(&parent));
         assert_eq!(replied_to(&reply), Some(parent.id));
         assert_eq!(replied_to(&parent), None);
+    }
+
+    #[test]
+    fn the_tally_names_why_each_fetched_message_was_left_out() {
+        let room = room();
+        let outsider = Keys::generate();
+        let previous = message(&room.owner, 100, "earlier question", CHANNEL, None);
+        let trigger = message(&room.owner, 200, "@me", CHANNEL, None);
+        let thread_reply = message(
+            &room.sibling,
+            150,
+            "threaded answer",
+            CHANNEL,
+            Some(&previous),
+        );
+        let candidates = vec![
+            message(&room.sibling, 50, "before the cursor", CHANNEL, None),
+            previous.clone(),
+            message(&room.me, 110, "my own", CHANNEL, Some(&previous)),
+            message(&outsider, 120, "not on the roster", CHANNEL, None),
+            thread_reply.clone(),
+            thread_reply,
+            trigger.clone(),
+            message(&room.sibling, 250, "after the batch", CHANNEL, None),
+        ];
+        let (kept, tally) = select(
+            candidates,
+            std::slice::from_ref(&trigger),
+            &room.roster,
+            &room.me.public_key(),
+            room.channel,
+            Some(Cursor {
+                event_id: previous.id,
+                created_at: previous.created_at,
+            }),
+        );
+        assert_eq!(texts(&kept), vec!["threaded answer"]);
+        assert_eq!(
+            tally,
+            Tally {
+                fetched: 8,
+                fetched_thread_replies: 3,
+                kept: 1,
+                own: 1,
+                not_before_batch: 1,
+                in_batch: 1,
+                before_cursor: 2,
+                not_on_roster: 1,
+                duplicate: 1,
+                ..Tally::default()
+            }
+        );
     }
 }
