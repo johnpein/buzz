@@ -1,8 +1,8 @@
 use std::io::{Read, Write};
 
 const TRUSTED_BUZZ_ACP_SHA256: &str =
-    "cd5fbc8eeba993e6a0e3c636b1525245f3328b902b8c35af2447007dc1b208c7";
-const TRUSTED_BUZZ_ACP: &str = "/Users/gabriel/.buzz/RUNTIME/buzz-acp/cd5fbc8eeba993e6a0e3c636b1525245f3328b902b8c35af2447007dc1b208c7/buzz-acp";
+    "8f428a1f03b3c9a51620d83b58f358346ae1dc0ff7ac4f5a2e2039ef6ab2b0ca";
+const TRUSTED_BUZZ_ACP: &str = "/Users/gabriel/.buzz/RUNTIME/buzz-acp/8f428a1f03b3c9a51620d83b58f358346ae1dc0ff7ac4f5a2e2039ef6ab2b0ca/buzz-acp";
 const CONTEXT_ENGINE_INSTALL_LOCK: &str =
     "/Users/gabriel/.buzz/RUNTIME/deployment-control/install.lock";
 const TRUSTED_CONTEXT_ENGINE_NODE: &str = "/Users/gabriel/.buzz/RUNTIME/trusted-node/d36b3d980963d44bd2c5e844fac4cfeee26a167b744287a4e74a9575af9d0559/node";
