@@ -72,14 +72,15 @@ pub fn build_verified_buzz_prompt_params(input: VerifiedBuzzPromptInput<'_>) -> 
         .iter()
         .map(|(pubkey, role)| {
             let pubkey = normalize_pubkey(pubkey)?;
-            // Buzz assigns co-located agent members a bot/agent role in a
-            // group channel: the hosted (production) relay uses `bot` (live
-            // 2026-09-19), the local relay api uses `agent` (`("agent", agent)`)
-            // — accept both so admission works against either. Rejecting them
-            // refused the very sibling agents group chat exists for; only
-            // `guest` (and anything unknown) stays rejected. Name the role so
-            // an unexpected one is diagnosable.
-            if !matches!(role.as_str(), "owner" | "admin" | "member" | "agent" | "bot") {
+            // `guest` denylist, not a role allowlist. Admission is already
+            // keyed on membership in the relay-signed roster, so an allowlist
+            // adds no security — and it broke group chat twice when the relay
+            // used a role it did not list (hosted relay: `bot`, live
+            // 2026-09-19; local relay api: `agent`). Any other role, including
+            // one Buzz adds later, is carried through verbatim. Matched
+            // ASCII-case-insensitively so a near-miss spelling cannot slip
+            // past; the TypeScript validator mirrors this exactly.
+            if role.eq_ignore_ascii_case("guest") {
                 bail!("unsupported Buzz membership role: {role}");
             }
             Ok(json!({"pubkey": pubkey, "role": role}))

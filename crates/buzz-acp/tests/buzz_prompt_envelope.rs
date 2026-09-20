@@ -1123,7 +1123,9 @@ fn stream_channel_three_members_sibling_authored_is_accepted() {
 fn stream_roster_with_guest_role_is_rejected() {
     let fixture = StreamFixture::new();
     let chat = fixture.sign_event_with(&fixture.owner.clone(), 9, "hi");
-    for bad_role in ["guest"] {
+    // The denylist matches ASCII-case-insensitively so a near-miss spelling
+    // cannot slip past it (mirrors the TypeScript validator).
+    for bad_role in ["guest", "Guest", "GUEST"] {
         let mut members = fixture.members.clone();
         members[2].1 = bad_role.to_string();
         assert!(
@@ -1133,6 +1135,28 @@ fn stream_roster_with_guest_role_is_rejected() {
             "a stream roster containing a {bad_role} role must be rejected",
         );
     }
+}
+
+#[test]
+fn stream_roster_with_unknown_role_is_accepted() {
+    // The role gate is a `guest` denylist, not an allowlist: admission is
+    // already keyed on membership in the relay-signed roster, and the old
+    // allowlist broke group chat twice when the relay used a role name it
+    // did not list (`bot`, `agent`). A future role must not break it again.
+    let fixture = StreamFixture::new();
+    let chat = fixture.sign_event_with(&fixture.owner.clone(), 9, "hi");
+    let mut members = fixture.members.clone();
+    members[2].1 = "moderator".to_string();
+    let params = fixture
+        .build_with_members(std::slice::from_ref(&chat), &members)
+        .unwrap_or_else(|e| panic!("a stream roster with an unknown role must be accepted: {e}"));
+    let roster = params["_meta"]["buzz"]["channel"]["members"]
+        .as_array()
+        .expect("members array");
+    assert!(
+        roster.iter().any(|member| member["role"] == "moderator"),
+        "the unknown role must be carried through verbatim",
+    );
 }
 
 #[test]
@@ -1151,7 +1175,9 @@ fn stream_roster_with_agent_or_bot_role_is_accepted() {
         members[2].1 = agent_role.to_string();
         let params = fixture
             .build_with_members(std::slice::from_ref(&chat), &members)
-            .unwrap_or_else(|e| panic!("a stream roster with {agent_role}-role members must be accepted: {e}"));
+            .unwrap_or_else(|e| {
+                panic!("a stream roster with {agent_role}-role members must be accepted: {e}")
+            });
         assert_eq!(params["_meta"]["buzz"]["channel"]["type"], json!("stream"));
     }
 }
