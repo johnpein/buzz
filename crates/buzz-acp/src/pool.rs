@@ -3635,6 +3635,36 @@ async fn build_verified_buzz_prompt_params_for_batch(
         .iter()
         .map(|batch_event| batch_event.event.clone())
         .collect::<Vec<_>>();
+    if channel_info.channel_type == "stream" {
+        // Room catch-up is context, not a trigger (see `room_catchup`). If the
+        // room cannot be read, deliver the batch alone rather than lose the turn.
+        let roster = members
+            .iter()
+            .map(|(pubkey, _)| pubkey.clone())
+            .collect::<Vec<_>>();
+        match crate::room_catchup::fetch(
+            &ctx.rest_client,
+            batch.channel_id,
+            &ctx.agent_keys.public_key(),
+            &roster,
+            &events,
+        )
+        .await
+        {
+            Ok(catchup) => {
+                tracing::info!(
+                    channel_id = %batch.channel_id,
+                    catchup = catchup.len(),
+                    "stream delivery carries room catch-up"
+                );
+                events.extend(catchup);
+            }
+            Err(error) => tracing::warn!(
+                channel_id = %batch.channel_id,
+                "stream delivery built without room catch-up: {error}"
+            ),
+        }
+    }
     events.sort_by(|left, right| {
         left.created_at
             .cmp(&right.created_at)

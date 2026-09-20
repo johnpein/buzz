@@ -14,6 +14,7 @@ mod prompt_project;
 mod queue;
 mod relay;
 mod reply_mentions;
+mod room_catchup;
 mod setup_mode;
 mod trusted_transport;
 mod usage;
